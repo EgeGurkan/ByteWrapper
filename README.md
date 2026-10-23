@@ -1,4 +1,4 @@
-# ByteWrapper
+# Byte Wrapper
 Byte Wrapper—a lightweight, user-friendly utility designed to bundle your scripts, files, and installers into seamless, self-contained executable packages (.exe).  Whether you're deploying batch files, PowerShell scripts, or custom tools, Byte Wrapper helps you automate execution, hide command windows, and secure your files effortlessly.
 
 <img width="380" height="600" alt="ByteWrapper" src="https://github.com/user-attachments/assets/d4ed8dd1-477f-45fd-b8f9-92384d363259" />
