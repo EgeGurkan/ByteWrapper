@@ -12,20 +12,20 @@ Key Features at a Glance
     Flexible Output Control: Define custom extraction directories (such as %Temp% or %ProgramFiles%) and configure automated cleanup.
 
     Advanced Options:
-        Hidden Run: Execute .bat, .cmd, or .ps1 files invisibly via an embedded VBS runner.
-        Crypto & Password Protection: Encrypt archive headers and protect your packages with custom passwords.
-        Custom Icons: Easily apply or extract high-resolution icons to give your packages a professional touch.
-        Others are as explained by its title.
-        Also Drag & Drop existing sfx/exe packages to top left main icon to review its code.
+        *Hidden Run: Execute .bat, .cmd, or .ps1 files invisibly via an embedded VBS runner.
+        *Crypto & Password Protection: Encrypt archive headers and protect your packages with custom passwords.
+        *Custom Icons: Easily apply or extract high-resolution icons to give your packages a professional touch.
+        *Others are as explained by its title.
+        *Also Drag & Drop existing sfx/exe packages to top left main icon to review its code.
 
-    Config Export & Import: Save your build settings into JSON configuration scripts for quick reuse and team sharing.
+    *Config Export & Import: Save your build settings into JSON configuration scripts for quick reuse and team sharing.
 
 Getting Started
 
-    Set your Source: Drag and drop your target file or folder into the Source Folder field.
-    Configure Paths: Choose where your package extracts and which file should run automatically upon launch.
-    Select Options: Toggle admin privileges, hidden execution, or compression based on your deployment needs.
-    Build: Click Start Process to generate your standalone, ready-to-use .exe package!
+    *Set your Source: Drag and drop your target file or folder into the Source Folder field.
+    *Configure Paths: Choose where your package extracts and which file should run automatically upon launch.
+    *Select Options: Toggle admin privileges, hidden execution, or compression based on your deployment needs.
+    *Build: Click Start Process to generate your standalone, ready-to-use .exe package!
 
 
 How To Install and Run
