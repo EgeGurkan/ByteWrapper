@@ -29,4 +29,5 @@ How To Install and Run
 You will need to have python and 7zip installed in your system and install necessary python components for this script to run.
 
 First install components via cmd, second save script via notepad and name it as "Byte Wrapper.py" or download and run.
+
 pip install PyQt6 Pillow pillow-jxl-plugin pywin32 pyinstaller
