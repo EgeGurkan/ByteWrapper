@@ -2,12 +2,14 @@ import os
 import re
 import sys
 import json
+import struct
 import base64
 import hashlib
 import shutil
 import ctypes
 import subprocess
 import tempfile
+import time
 import mmap
 import io
 from datetime import datetime
@@ -26,23 +28,15 @@ if os.name == "nt":
     except Exception:
         pass
 
-# Display unexpected startup errors instead of failing silently with a hidden console.
+
+# Show unexpected startup errors without creating an error log file.
 def _show_uncaught_error(exc_type, exc_value, exc_tb):
-    import traceback
-    details = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-    log_file = os.path.join(tempfile.gettempdir(), "byte_wrapper_error.log")
-    try:
-        with open(log_file, "w", encoding="utf-8") as log:
-            log.write(details)
-    except OSError:
-        pass
     sys.__excepthook__(exc_type, exc_value, exc_tb)
     if os.name == "nt":
         try:
             ctypes.windll.user32.MessageBoxW(
                 None,
-                "Byte Wrapper encountered an error:\n\n"
-                + str(exc_value) + "\n\nDetails: " + log_file,
+                "Byte Wrapper encountered an error:\n\n" + str(exc_value),
                 "Byte Wrapper Error", 0x10,
             )
         except Exception:
@@ -54,7 +48,7 @@ sys.excepthook = _show_uncaught_error
 
 from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import (
-    QIcon, QPixmap, QDragEnterEvent, QDropEvent, QPainter, QColor, QBrush, QPen
+    QIcon, QPixmap, QDragEnterEvent, QDropEvent
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -62,64 +56,11 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMenu, QMessageBox
 )
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 try:
     import pillow_jxl  # Support for .jxl files
 except ImportError:
     pass
-
-
-# ==========================================
-# BYTEHIDDEN.VBS - EMBEDDED SCRIPT (EDIT BELOW)
-# ==========================================
-# This text is written to the SFX archive only when Hidden Run is enabled.
-# Edit the VBScript between triple quotes and rebuild the package to apply.
-# No separate ByteHidden.vbs file is required.
-BYTE_HIDDEN_VBS = r'''Option Explicit
-' Byte Wrapper script launcher, embedded in the Python source.
-' Edit the BYTE_HIDDEN_VBS block in Python and rebuild to apply changes.
-' You can add MsgBox statements here. They will remain visible, while the
-' BAT/CMD/PowerShell console window is not displayed.
-
-Dim shell, fso, scriptPath, scriptExt, command, parameters, exitCode, i
-
-If WScript.Arguments.Count < 1 Then
-    MsgBox "No script path was provided.", vbExclamation, "Byte Wrapper"
-    WScript.Quit 2
-End If
-
-Set shell = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
-scriptPath = WScript.Arguments(0)
-
-If Not fso.FileExists(scriptPath) Then
-    MsgBox "Script not found: " & scriptPath, vbCritical, "Byte Wrapper"
-    WScript.Quit 2
-End If
-
-scriptExt = LCase(fso.GetExtensionName(scriptPath))
-parameters = ""
-For i = 1 To WScript.Arguments.Count - 1
-    parameters = parameters & " " & Chr(34) & Replace(WScript.Arguments(i), Chr(34), Chr(34) & Chr(34)) & Chr(34)
-Next
-
-Select Case scriptExt
-    Case "bat", "cmd"
-        ' The outer quotes allow cmd.exe /S /C to preserve a quoted path.
-        command = "cmd.exe /D /S /C " & Chr(34) & Chr(34) & scriptPath & Chr(34) & parameters & Chr(34)
-    Case "ps1"
-        command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File " & Chr(34) & scriptPath & Chr(34) & parameters
-    Case Else
-        MsgBox "Only BAT, CMD and PS1 scripts are supported.", vbExclamation, "Byte Wrapper"
-        WScript.Quit 2
-End Select
-
-shell.CurrentDirectory = fso.GetParentFolderName(scriptPath)
-' Example: MsgBox "Running: " & fso.GetFileName(scriptPath), vbInformation, "Byte Wrapper"
-exitCode = shell.Run(command, 0, True)
-' Example: MsgBox "Finished with exit code: " & exitCode, vbInformation, "Byte Wrapper"
-WScript.Quit exitCode
-'''
 
 
 # ==========================================
@@ -214,19 +155,85 @@ def decrypt_password_from_import(cipher_text: str) -> str:
 
 
 # ==========================================
-# ICON UTILITIES - DRAWN DEFAULT ICON
+# HIGH-DEFINITION ICON UTILITIES
 # ==========================================
-# The default box is drawn with Pillow at runtime; there is no embedded ICO,
-# zlib stream or external icon file. The generated ICO is used for
-# SFX EXEs; the GUI instead loads its largest layer into a QPixmap.
-def draw_default_sfx_icon(out_ico_path: str) -> None:
-    """Render the user's clean line-art parcel icon as a multi-size Windows ICO.
+def save_crisp_multi_ico(master_img: Image.Image, out_ico_path: str,
+                         sizes=(256, 128, 64, 48, 32, 24, 16)) -> bool:
+    """Build a multi-resolution Windows ICO with LANCZOS resampling per layer.
 
-    Geometry is drawn at 1024 px (smooth edges), then downsampled for Windows.
-    No external image or embedded Base64 data is needed.
+    Unlike Pillow's default single-image ICO writer, this resamples every layer
+    directly from the high-resolution master image, applies subtle edge sharpening
+    for small icon sizes, and writes a PNG frame for 256x256 plus 32-bit BGRA DIB
+    frames for smaller sizes (ordered largest-first).
     """
-    canvas = 1024
+    try:
+        src = master_img.convert("RGBA")
+        # Ensure square canvas while preserving aspect ratio
+        if src.width != src.height:
+            side = max(src.width, src.height)
+            square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+            square.paste(src, ((side - src.width) // 2, (side - src.height) // 2))
+            src = square
+
+        entries = []
+        payloads = []
+
+        for sz in sizes:
+            layer = src.resize((sz, sz), Image.Resampling.LANCZOS)
+            if sz <= 48:
+                layer = layer.filter(ImageFilter.UnsharpMask(radius=0.7, percent=55, threshold=2))
+
+            if sz >= 256:
+                buf = io.BytesIO()
+                layer.save(buf, format="PNG", optimize=True)
+                raw_data = buf.getvalue()
+            else:
+                flipped = layer.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                xor_mask = flipped.tobytes("raw", "BGRA")
+                and_row_bytes = ((sz + 31) // 32) * 4
+                and_mask = b"\x00" * (and_row_bytes * sz)
+                bmp_header = struct.pack(
+                    "<IIIHHIIIIII",
+                    40,                        # biSize
+                    sz,                        # biWidth
+                    sz * 2,                    # biHeight (XOR + AND)
+                    1,                         # biPlanes
+                    32,                        # biBitCount
+                    0,                         # biCompression (BI_RGB)
+                    len(xor_mask) + len(and_mask),
+                    0, 0, 0, 0
+                )
+                raw_data = bmp_header + xor_mask + and_mask
+
+            w_byte = 0 if sz >= 256 else sz
+            h_byte = 0 if sz >= 256 else sz
+            entries.append((w_byte, h_byte, 0, 0, 1, 32, len(raw_data)))
+            payloads.append(raw_data)
+
+        header = struct.pack("<HHH", 0, 1, len(entries))
+        offset = 6 + 16 * len(entries)
+        dir_bytes = bytearray()
+        for w_b, h_b, col, res, planes, bpp, length in entries:
+            dir_bytes.extend(struct.pack("<BBBBHHII", w_b, h_b, col, res, planes, bpp, length, offset))
+            offset += length
+
+        with open(out_ico_path, "wb") as f:
+            f.write(header)
+            f.write(dir_bytes)
+            for chunk in payloads:
+                f.write(chunk)
+        return True
+    except Exception:
+        return False
+
+
+def _render_parcel_canvas(canvas: int = 1024, stroke_scale: float = 1.0) -> Image.Image:
+    """Render the clean vector parcel icon onto an RGBA canvas."""
     factor = canvas / 214.0
+    img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    ink = "#383838"
+    face = "#ffffff"
 
     def xy(x, y):
         return (round(x * factor), round(y * factor))
@@ -234,52 +241,41 @@ def draw_default_sfx_icon(out_ico_path: str) -> None:
     def poly(points, fill):
         draw.polygon([xy(*point) for point in points], fill=fill)
 
-    def stroke(points, width=6):
+    def stroke(points, width=6.5):
+        w = max(1, round(width * stroke_scale * factor))
         coords = [xy(*point) for point in points]
-        draw.line(coords, fill=ink, width=round(width * factor), joint='curve')
-        # Round exposed ends/corners to avoid harsh pixels when downsampled.
-        r = width * factor / 2
+        draw.line(coords, fill=ink, width=w, joint="curve")
+        r = w / 2.0
         for cx, cy in (coords[0], coords[-1]):
-            draw.ellipse((round(cx-r), round(cy-r), round(cx+r), round(cy+r)), fill=ink)
+            draw.ellipse((round(cx - r), round(cy - r), round(cx + r), round(cy + r)), fill=ink)
 
-    img = Image.new('RGBA', (canvas, canvas), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    ink = '#414141'
-    face = '#ffffff'
-
-    # White panels stay legible against the GUI's dark background.
-    poly([(12, 53), (105, 15), (198, 53), (106, 96)], face)  # top
+    poly([(12, 53), (105, 15), (198, 53), (106, 96)], face)   # top
     poly([(12, 53), (106, 96), (106, 205), (12, 162)], face)  # left
     poly([(106, 96), (198, 53), (198, 162), (106, 205)], face)  # right
 
-    # Outer contour and three visible vertical/fold edges.
     stroke([(12, 53), (105, 15), (198, 53), (198, 162),
-            (106, 205), (12, 162), (12, 53)], width=6.5)
-    stroke([(12, 53), (106, 96), (198, 53)], width=6.5)
-    stroke([(106, 96), (106, 205)], width=6.5)
+            (106, 205), (12, 162), (12, 53)], width=6.8)
+    stroke([(12, 53), (106, 96), (198, 53)], width=6.8)
+    stroke([(106, 96), (106, 205)], width=6.8)
 
-    # Two top stripes and the vertical flap on the right face.
-    stroke([(43, 40), (138, 80)], width=5.8)
-    stroke([(76, 27), (166, 68)], width=5.8)
-    stroke([(139, 80), (139, 120), (166, 110), (166, 68)], width=6)
+    stroke([(43, 40), (138, 80)], width=6.0)
+    stroke([(76, 27), (166, 68)], width=6.0)
+    stroke([(139, 80), (139, 120), (166, 110), (166, 68)], width=6.2)
+    return img
 
-    icon = img.resize((256, 256), Image.Resampling.LANCZOS)
-    icon.save(out_ico_path, format='ICO',
-              sizes=[(256, 256), (128, 128), (64, 64),
-                     (48, 48), (32, 32), (16, 16)])
+
+def draw_default_sfx_icon(out_ico_path: str) -> None:
+    """Render the parcel icon as a sharp multi-size Windows ICO."""
+    img = _render_parcel_canvas(1024, stroke_scale=1.08)
+    save_crisp_multi_ico(img, out_ico_path)
+
 
 def get_app_icon_path() -> str:
     """Return a reusable, drawn default ICO without unpacking embedded data."""
-    icon_path = os.path.join(tempfile.gettempdir(), "byte_wrapper_vector_box_v3.ico")
-    if os.path.isfile(icon_path):
-        try:
-            with Image.open(icon_path) as existing:
-                if existing.format == "ICO" and existing.size[0] >= 128:
-                    return icon_path
-        except (OSError, ValueError):
-            pass
+    icon_path = os.path.join(tempfile.gettempdir(), "byte_wrapper_vector_box_v4.ico")
+    if os.path.isfile(icon_path) and os.path.getsize(icon_path) > 4096:
+        return icon_path
     try:
-        # Atomic replacement prevents partial icons during concurrent launches.
         with tempfile.NamedTemporaryFile(prefix="bw_icon_", suffix=".ico",
                                          dir=tempfile.gettempdir(), delete=False) as tmp:
             pending_path = tmp.name
@@ -291,107 +287,367 @@ def get_app_icon_path() -> str:
                 os.unlink(pending_path)
         return icon_path
     except (OSError, ValueError) as exc:
-        # The program should still open even when TEMP is not writable.
         print("Unable to create drawn icon:", exc, file=sys.stderr)
         return ""
 
 
+def load_best_pil_from_ico(ico_path: str) -> Image.Image | None:
+    """Extract the highest-resolution 32-bit RGBA layer from any .ico file."""
+    if not ico_path or not os.path.isfile(ico_path):
+        return None
+    try:
+        with open(ico_path, "rb") as f:
+            data = f.read()
+        if len(data) >= 6:
+            reserved, ico_type, count = struct.unpack_from("<HHH", data, 0)
+            if reserved == 0 and ico_type == 1 and count > 0:
+                candidates = []
+                for i in range(count):
+                    pos = 6 + i * 16
+                    if pos + 16 > len(data):
+                        break
+                    w, h, col, rsv, planes, bpp, size, offset = struct.unpack_from("<BBBBHHII", data, pos)
+                    real_w = 256 if w == 0 else w
+                    real_h = 256 if h == 0 else h
+                    if offset + size <= len(data) and size > 0:
+                        candidates.append((real_w * real_h, bpp, i, offset, size, data[offset:offset + size]))
 
-def load_crisp_gui_icon(ico_path: str) -> QIcon:
-    """Use the largest ICO layer as a high-resolution in-memory GUI image.
+                candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                for _, _, _, offset, size, chunk in candidates:
+                    if chunk.startswith(b"\x89PNG\r\n\x1a\n"):
+                        with Image.open(io.BytesIO(chunk)) as png_img:
+                            return png_img.convert("RGBA")
+                    # Reconstruct a single-entry ICO in memory so Pillow decodes this exact layer
+                    single_dir = bytearray(data[6:22])
+                    for _, _, idx, _, _, _ in candidates:
+                        pos = 6 + idx * 16
+                        single_dir = bytearray(data[pos:pos + 16])
+                        break
+                    struct.pack_into("<I", single_dir, 12, 22)
+                    single_ico = struct.pack("<HHH", 0, 1, 1) + bytes(single_dir) + chunk
+                    try:
+                        with Image.open(io.BytesIO(single_ico)) as sub_img:
+                            return sub_img.convert("RGBA")
+                    except Exception:
+                        continue
+    except Exception:
+        pass
 
-    Qt may otherwise pick a 16x16 ICO layer, which looks blurry when the
-    36x36 header logo or 24x24 selection button scales it upward.
-    """
-    if not ico_path:
-        return QIcon()
     try:
         with Image.open(ico_path) as source:
-            if source.format == 'ICO' and hasattr(source, 'ico'):
+            if source.format == "ICO" and hasattr(source, "ico"):
                 sizes = source.ico.sizes()
                 largest = max(sizes, key=lambda pair: pair[0] * pair[1])
-                raster = source.ico.getimage(largest).convert('RGBA')
+                return source.ico.getimage(largest).convert("RGBA")
+            return source.convert("RGBA")
+    except Exception:
+        return None
+
+
+def pil_to_qpixmap(pil_img: Image.Image, logical_size: int, dpr: float = 1.0) -> QPixmap:
+    """Render a PIL image at the exact physical pixel size (logical_size * dpr) using LANCZOS."""
+    target_px = max(1, round(logical_size * dpr))
+    if pil_img.width != target_px or pil_img.height != target_px:
+        resampled = pil_img.resize((target_px, target_px), Image.Resampling.LANCZOS)
+        if target_px <= 48:
+            resampled = resampled.filter(ImageFilter.UnsharpMask(radius=0.6, percent=45, threshold=2))
+    else:
+        resampled = pil_img
+
+    stream = io.BytesIO()
+    resampled.save(stream, format="PNG")
+    pixmap = QPixmap()
+    pixmap.loadFromData(stream.getvalue(), "PNG")
+    pixmap.setDevicePixelRatio(dpr)
+    return pixmap
+
+
+def load_crisp_gui_icon(ico_path: str, dpr: float = 1.0) -> QIcon:
+    """Build a multi-size LANCZOS-resampled QIcon so Qt never performs blurry scaling."""
+    pil_img = load_best_pil_from_ico(ico_path)
+    if pil_img is None:
+        return QIcon(ico_path) if ico_path else QIcon()
+
+    icon = QIcon()
+    for sz in (16, 20, 24, 28, 32, 36, 40, 48, 64, 96, 128, 256):
+        pix_1x = pil_to_qpixmap(pil_img, sz, 1.0)
+        if not pix_1x.isNull():
+            icon.addPixmap(pix_1x)
+        if dpr > 1.0:
+            pix_hi = pil_to_qpixmap(pil_img, sz, dpr)
+            if not pix_hi.isNull():
+                icon.addPixmap(pix_hi)
+    return icon
+
+
+def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0) -> bytes:
+    """Extract raw, untouched RT_GROUP_ICON + RT_ICON bytes directly from a PE (.exe/.dll/.mun) file."""
+    if os.name != "nt" or not pe_path or not os.path.isfile(pe_path):
+        return b""
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.LoadLibraryExW.restype = ctypes.c_void_p
+    kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
+    kernel32.FreeLibrary.restype = ctypes.c_int
+    kernel32.FindResourceW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.FindResourceW.restype = ctypes.c_void_p
+    kernel32.LoadResource.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.LoadResource.restype = ctypes.c_void_p
+    kernel32.LockResource.argtypes = [ctypes.c_void_p]
+    kernel32.LockResource.restype = ctypes.c_void_p
+    kernel32.SizeofResource.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.SizeofResource.restype = ctypes.c_uint32
+
+    LOAD_LIBRARY_AS_DATAFILE = 0x00000002
+    LOAD_LIBRARY_AS_IMAGE_RESOURCE = 0x00000020
+    RT_ICON = 3
+    RT_GROUP_ICON = 14
+
+    hmod = kernel32.LoadLibraryExW(
+        pe_path, None, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE
+    )
+    if not hmod:
+        return b""
+
+    try:
+        group_ids = []
+        ENUMRESNAMEPROCW = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ssize_t
+        )
+
+        def _enum_cb(_hModule, _lpszType, lpszName, _lParam):
+            if not lpszName:
+                return 1
+            if lpszName < 0x10000:
+                group_ids.append(int(lpszName))
             else:
-                raster = source.convert('RGBA')
-            stream = io.BytesIO()
-            raster.save(stream, format='PNG')
-        pixmap = QPixmap()
-        if pixmap.loadFromData(stream.getvalue(), 'PNG') and not pixmap.isNull():
-            return QIcon(pixmap)
-    except (OSError, ValueError, AttributeError):
+                group_ids.append(ctypes.wstring_at(lpszName))
+            return 1
+
+        cb_func = ENUMRESNAMEPROCW(_enum_cb)
+        kernel32.EnumResourceNamesW(hmod, ctypes.c_void_p(RT_GROUP_ICON), cb_func, 0)
+
+        if not group_ids:
+            return b""
+
+        target_id = None
+        if icon_index < 0:
+            abs_id = abs(icon_index)
+            if abs_id in group_ids:
+                target_id = abs_id
+            elif str(abs_id) in group_ids:
+                target_id = str(abs_id)
+        if target_id is None:
+            idx = icon_index if 0 <= icon_index < len(group_ids) else 0
+            target_id = group_ids[idx]
+
+        def _find_and_read(res_type: int, res_id) -> bytes:
+            if isinstance(res_id, int):
+                name_ptr = ctypes.c_void_p(res_id)
+            else:
+                name_ptr = ctypes.cast(ctypes.c_wchar_p(res_id), ctypes.c_void_p)
+            hres = kernel32.FindResourceW(hmod, name_ptr, ctypes.c_void_p(res_type))
+            if not hres:
+                return b""
+            size = kernel32.SizeofResource(hmod, hres)
+            if size == 0:
+                return b""
+            hglob = kernel32.LoadResource(hmod, hres)
+            if not hglob:
+                return b""
+            ptr = kernel32.LockResource(hglob)
+            if not ptr:
+                return b""
+            return ctypes.string_at(ptr, size)
+
+        grp_data = _find_and_read(RT_GROUP_ICON, target_id)
+        if len(grp_data) < 6:
+            return b""
+
+        reserved, res_type_hdr, count = struct.unpack_from("<HHH", grp_data, 0)
+        if reserved != 0 or res_type_hdr != 1 or count == 0:
+            return b""
+
+        valid_layers = []
+        for i in range(count):
+            pos = 6 + i * 14
+            if pos + 14 > len(grp_data):
+                break
+            entry_12 = grp_data[pos:pos + 12]
+            n_id, = struct.unpack_from("<H", grp_data, pos + 12)
+            icon_chunk = _find_and_read(RT_ICON, n_id)
+            if icon_chunk:
+                valid_layers.append((entry_12, icon_chunk))
+
+        if not valid_layers:
+            return b""
+
+        out_header = struct.pack("<HHH", 0, 1, len(valid_layers))
+        offset = 6 + 16 * len(valid_layers)
+        out_dir = bytearray()
+        out_payloads = bytearray()
+
+        for entry_12, chunk in valid_layers:
+            # Update dwBytesInRes with exact chunk size and append 4-byte file offset
+            fixed_12 = entry_12[:8] + struct.pack("<I", len(chunk))
+            out_dir.extend(fixed_12)
+            out_dir.extend(struct.pack("<I", offset))
+            out_payloads.extend(chunk)
+            offset += len(chunk)
+
+        return out_header + bytes(out_dir) + bytes(out_payloads)
+    finally:
+        kernel32.FreeLibrary(hmod)
+
+
+def _resolve_associated_icon_source(file_path: str) -> tuple[str, int]:
+    """Find the system binary and icon index associated with a script or file extension."""
+    ext = os.path.splitext(file_path)[1].lower()
+    sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+    sys32 = os.path.join(sys_root, "System32")
+
+    known_map = {
+        ".ps1": (os.path.join(sys32, r"WindowsPowerShell\v1.0\powershell.exe"), 0),
+        ".reg": (os.path.join(sys_root, "regedit.exe"), 0),
+        ".msi": (os.path.join(sys32, "msiexec.exe"), 0),
+        ".bat": (os.path.join(sys32, "imageres.dll"), -68),
+        ".cmd": (os.path.join(sys32, "imageres.dll"), -68),
+    }
+    if ext in known_map:
+        bin_path, idx = known_map[ext]
+        if os.path.isfile(bin_path):
+            return bin_path, idx
+
+    # Query Windows Shell file association DefaultIcon
+    try:
+        ASSOCSTR_DEFAULTICON = 15
+        buf = ctypes.create_unicode_buffer(512)
+        cch = ctypes.c_uint32(512)
+        hr = ctypes.windll.shlwapi.AssocQueryStringW(
+            0, ASSOCSTR_DEFAULTICON, ctypes.c_wchar_p(ext), None, buf, ctypes.byref(cch)
+        )
+        if hr == 0 and buf.value:
+            raw_val = os.path.expandvars(buf.value.strip())
+            idx = 0
+            if "," in raw_val:
+                path_part, idx_part = raw_val.rsplit(",", 1)
+                raw_val = path_part.strip().strip('"')
+                try:
+                    idx = int(idx_part.strip())
+                except ValueError:
+                    idx = 0
+            else:
+                raw_val = raw_val.strip('"')
+            if os.path.isfile(raw_val):
+                return raw_val, idx
+    except Exception:
         pass
-    return QIcon(ico_path)
+
+    return file_path, 0
 
 
 def extract_icon_from_file(file_path: str, out_ico_path: str) -> bool:
-    """
-    Extracts the icon from an .exe or associated file using Windows API
-    (ExtractIconEx or ExtractAssociatedIcon) and saves it as a multi-size .ico.
-    """
+    """Extract a lossless, high-resolution multi-size .ico from an .exe, DLL, or script."""
+    if not file_path or not os.path.isfile(file_path):
+        return False
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".ico":
+        try:
+            shutil.copy2(file_path, out_ico_path)
+            return True
+        except OSError:
+            return False
+
+    target_bin, icon_idx = _resolve_associated_icon_source(file_path)
+
+    # 1. Try direct lossless PE resource extraction (plus Windows 10/11 .mun resource store)
+    candidates_to_try = [target_bin]
+    sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+    mun_candidate = os.path.join(sys_root, "SystemResources", os.path.basename(target_bin) + ".mun")
+    if os.path.isfile(mun_candidate):
+        candidates_to_try.append(mun_candidate)
+
+    for candidate in candidates_to_try:
+        ico_bytes = _extract_pe_icon_bytes(candidate, icon_idx)
+        if ico_bytes:
+            try:
+                with open(out_ico_path, "wb") as f:
+                    f.write(ico_bytes)
+                # Verify and normalize if needed
+                best_pil = load_best_pil_from_ico(out_ico_path)
+                if best_pil is not None and best_pil.width >= 48:
+                    return True
+            except OSError:
+                pass
+
+    # 2. Fallback: Use PrivateExtractIconsW with a 32-bit RGBA DIBSection
     try:
         import win32ui
         import win32gui
         import win32con
-        import win32api
-
-        ico_x = win32api.GetSystemMetrics(win32con.SM_CXICON)
-        ico_y = win32api.GetSystemMetrics(win32con.SM_CYICON)
 
         hicon = 0
-        large, small = [], []
-        try:
-            large, small = win32gui.ExtractIconEx(file_path, 0)
-            if large:
-                hicon = large[0]
-            elif small:
-                hicon = small[0]
-        except Exception:
-            pass
+        for candidate in candidates_to_try:
+            phicon = (ctypes.c_void_p * 1)()
+            piconid = (ctypes.c_uint * 1)()
+            count = ctypes.windll.user32.PrivateExtractIconsW(
+                ctypes.c_wchar_p(candidate), icon_idx, 256, 256,
+                phicon, piconid, 1, 0
+            )
+            if count > 0 and phicon[0]:
+                hicon = phicon[0]
+                break
 
-        # Fallback to ExtractAssociatedIconW via shell32 for scripts (.cmd, .bat, .ps1, etc.)
         if not hicon:
             buf = ctypes.create_unicode_buffer(file_path, 260)
             pi_icon = ctypes.c_uint16(0)
-            hicon = ctypes.windll.shell32.ExtractAssociatedIconW(
-                0, buf, ctypes.byref(pi_icon)
-            )
+            hicon = ctypes.windll.shell32.ExtractAssociatedIconW(0, buf, ctypes.byref(pi_icon))
 
         if not hicon:
             return False
 
-        hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+        size = 256
+        screen_dc = win32gui.GetDC(0)
+        hdc_screen = win32ui.CreateDCFromHandle(screen_dc)
+        hdc_mem = hdc_screen.CreateCompatibleDC()
         hbmp = win32ui.CreateBitmap()
-        hbmp.CreateCompatibleBitmap(hdc, ico_x, ico_y)
-        hdc = hdc.CreateCompatibleDC()
-        hdc.SelectObject(hbmp)
-        hdc.DrawIcon((0, 0), hicon)
+        hbmp.CreateCompatibleBitmap(hdc_screen, size, size)
+        old_bmp = hdc_mem.SelectObject(hbmp)
 
-        bmpinfo = hbmp.GetInfo()
-        bmpstr = hbmp.GetBitmapBits(True)
-        img = Image.frombuffer(
-            "RGBA",
-            (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
-            bmpstr, "raw", "BGRA", 0, 1
-        )
-        img.save(out_ico_path, format="ICO", sizes=[(256, 256), (64, 64), (32, 32), (16, 16)])
-
-        for h in large:
-            win32gui.DestroyIcon(h)
-        for h in small:
-            win32gui.DestroyIcon(h)
-        if not large and not small and hicon:
+        try:
+            win32gui.DrawIconEx(
+                hdc_mem.GetSafeHdc(), 0, 0, hicon,
+                size, size, 0, None, win32con.DI_NORMAL
+            )
+            bmpinfo = hbmp.GetInfo()
+            bmpstr = hbmp.GetBitmapBits(True)
+            img = Image.frombuffer(
+                "RGBA",
+                (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+                bmpstr, "raw", "BGRA", 0, 1
+            )
+            return save_crisp_multi_ico(img, out_ico_path)
+        finally:
+            hdc_mem.SelectObject(old_bmp)
+            win32gui.DeleteObject(hbmp.GetHandle())
+            hdc_mem.DeleteDC()
+            hdc_screen.DeleteDC()
+            win32gui.ReleaseDC(0, screen_dc)
             ctypes.windll.user32.DestroyIcon(hicon)
-        return True
     except Exception:
         return False
 
 
 def convert_image_to_ico(src_path: str, out_ico_path: str) -> bool:
-    """Converts PNG, JPG, JPEG, JXL, or ICO files into a standard Windows .ico file."""
+    """Converts PNG, JPG, JPEG, JXL, or ICO files into a crisp Windows .ico file."""
     try:
-        img = Image.open(src_path).convert("RGBA")
-        img.save(out_ico_path, format="ICO", sizes=[(256, 256), (128, 128), (64, 64), (32, 32), (16, 16)])
-        return True
+        if src_path.lower().endswith(".ico"):
+            shutil.copy2(src_path, out_ico_path)
+            return True
+        with Image.open(src_path) as img:
+            return save_crisp_multi_ico(img.convert("RGBA"), out_ico_path)
     except Exception:
         return False
 
@@ -402,7 +658,7 @@ def convert_image_to_ico(src_path: str, out_ico_path: str) -> bool:
 class SmartLineEdit(QLineEdit):
     """
     Supports direct typing, drag-and-drop, and pops up an English selection menu
-    when clicked or right-clicked.
+    when right-clicked (or when left-clicked while empty).
     """
     def __init__(self, placeholder="", mode="source", parent_win=None):
         super().__init__(parent_win)
@@ -414,7 +670,7 @@ class SmartLineEdit(QLineEdit):
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton and not self.text().strip():
             self.open_selector()
 
     def contextMenuEvent(self, event):
@@ -527,13 +783,13 @@ class SmartLineEdit(QLineEdit):
                 )
                 if file_path:
                     norm_file = os.path.normpath(file_path)
-                    if start_dir and norm_file.lower().startswith(os.path.normpath(start_dir).lower()):
-                        rel_path = os.path.relpath(norm_file, start_dir)
-                        ext_to = self.parent_win.inp_extract.text().strip() if self.parent_win else ""
-                        if ext_to:
-                            self.setText(os.path.join(ext_to, rel_path))
-                        else:
-                            self.setText(rel_path)
+                    norm_start = os.path.normpath(start_dir) if start_dir else ""
+                    if norm_start and (
+                        norm_file.lower() == norm_start.lower()
+                        or norm_file.lower().startswith(norm_start.lower() + os.sep)
+                    ):
+                        rel_path = os.path.relpath(norm_file, norm_start)
+                        self.setText(rel_path)
                     else:
                         self.setText(norm_file)
             elif action == act_manual:
@@ -551,7 +807,11 @@ class SmartLineEdit(QLineEdit):
             if urls:
                 local_path = urls[0].toLocalFile()
                 if local_path:
-                    self.setText(os.path.normpath(local_path))
+                    dropped_path = os.path.normpath(local_path)
+                    if self.mode == "source" and self.parent_win is not None:
+                        self.parent_win.on_source_dropped(dropped_path)
+                    else:
+                        self.setText(dropped_path)
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
@@ -595,6 +855,56 @@ class SFXDropLogo(QLabel):
             event.acceptProposedAction()
         else:
             event.ignore()
+
+
+def _looks_like_self_elevating_script(path: str) -> bool:
+    """Recognize common script self-elevation patterns without executing the script.
+
+    Used to request normal Windows UAC consent before Hidden Run.
+    The detection is intentionally conservative.
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return False
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".bat", ".cmd", ".ps1"):
+            return False
+        with open(path, "rb") as f:
+            content = f.read(512 * 1024).decode("utf-8-sig", errors="replace")
+        # Exclude ordinary line comments; preserve the actual commands.
+        lines = [line for line in content.splitlines()
+                 if not re.match(r"^\s*(?:rem\s|::|#)", line, re.IGNORECASE)]
+        active = "\n".join(lines)
+        if ext == ".ps1":
+            return bool(re.search(r"(?i)\bstart-process\b[^\r\n]*\s-verb\s+['\"]?runas\b", active))
+        # WindowsUpdateTools.cmd: `fltmc || ... start ...` invokes a second
+        # console through a temporary .Admin file association without admin.
+        if re.search(r"(?im)^.*\b(?:fltmc|net\s+session)\b[^\r\n]*\|\|[^\r\n]*\bstart\b", active):
+            return True
+        # Common BAT elevation via PowerShell and ShellExecute RunAs.
+        return bool(re.search(r"(?i)\bstart-process\b[^\r\n]*-verb\s+['\"]?runas\b", active))
+    except (OSError, UnicodeError):
+        return False
+
+
+def _remove_build_directory_safely(path: str) -> bool:
+    """Retry transient Windows sharing violations without atexit cleanup errors.
+
+    Windows AV/indexers may briefly hold payload.dat after csc.exe exits.
+    Failure to delete a temporary directory must never invalidate a built EXE.
+    """
+    for attempt in range(9):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if attempt == 8 or (getattr(exc, "winerror", None) not in (5, 32)
+                                and not isinstance(exc, PermissionError)):
+                return False
+            time.sleep(0.25 + attempt * 0.15)
+    return False
 
 
 # ==========================================
@@ -645,20 +955,10 @@ class SFXBuilderWorker(QThread):
 
         if self.cfg["dont_replace"] and os.path.exists(target_path):
             now_dt = datetime.now()
-            # 24-hour format DD.MM.YYYY HH.MM.SS (safe for Windows filenames)
             fs_stamp = now_dt.strftime("%d.%m.%Y %H.%M.%S")
             target_path = os.path.join(out_dir, f"{name}_{fs_stamp}.exe")
 
         return target_path
-
-    def generate_helper_scripts(self, work_dir: str) -> list:
-        """Write the editable VBS text embedded at the top of this Python script."""
-        if not self.cfg['hidden_run']:
-            return []
-        packaged_vbs = os.path.join(work_dir, '_byte_hidden.vbs')
-        with open(packaged_vbs, 'w', encoding='utf-8', newline='\r\n') as output:
-            output.write(BYTE_HIDDEN_VBS)
-        return [packaged_vbs]
 
     def get_internal_7z_password(self) -> str:
         """
@@ -672,11 +972,10 @@ class SFXBuilderWorker(QThread):
             return "byte"
         return ""
 
-    def build_7z_archive(self, seven_zip: str, source_path: str, archive_path: str, extra_files: list) -> subprocess.CompletedProcess:
+    def build_7z_archive(self, seven_zip: str, source_path: str, archive_path: str) -> subprocess.CompletedProcess:
         cmd = [seven_zip, "a"]
 
         if self.cfg["compress"]:
-            # 7z format, 9-ultra, lzma2, dict 256mb, word size 64, solid 16g, max cpu threads
             cmd.extend([
                 "-t7z",
                 "-mx=9",
@@ -691,7 +990,6 @@ class SFXBuilderWorker(QThread):
 
         internal_pw = self.get_internal_7z_password()
         if internal_pw:
-            # -mhe=on encrypts archive headers so filenames are never visible in 7-Zip
             cmd.extend([f"-p{internal_pw}", "-mhe=on"])
 
         cmd.extend(["-y", archive_path])
@@ -701,30 +999,35 @@ class SFXBuilderWorker(QThread):
         else:
             cmd.append(source_path)
 
-        cmd.extend(extra_files)
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         return subprocess.run(cmd, capture_output=True, text=True, creationflags=creation_flags)
 
-    def obfuscate_payload(self, raw_7z_path: str, out_dat_path: str) -> bool:
+    def prepare_payload(self, raw_7z_path: str, out_dat_path: str) -> tuple[str, bool]:
         """
-        When Crypto is enabled, scrambles the binary payload and 7z signature
+        When Crypto is enabled, scrambles the binary payload in chunks
         so the encrypted package is not directly readable by 7-Zip.
+        When Crypto is disabled, reuses raw_7z_path directly so 7-Zip can open it.
         """
-        should_scramble = self.cfg["crypto"]
+        if not self.cfg["crypto"]:
+            return raw_7z_path, False
+
         key_bytes = b"byte_wrapper_secret_key_2026"
         key_len = len(key_bytes)
+        chunk_size = 1024 * 1024  # 1 MB chunks
+        offset = 0
 
-        with open(raw_7z_path, "rb") as fin:
-            data = bytearray(fin.read())
+        with open(raw_7z_path, "rb") as fin, open(out_dat_path, "wb") as fout:
+            while True:
+                buf = bytearray(fin.read(chunk_size))
+                if not buf:
+                    break
+                for i in range(len(buf)):
+                    global_idx = offset + i
+                    buf[i] ^= key_bytes[global_idx % key_len] ^ ((global_idx & 0xFF) ^ 0xA5)
+                fout.write(buf)
+                offset += len(buf)
 
-        if should_scramble:
-            for i in range(len(data)):
-                data[i] ^= key_bytes[i % key_len] ^ ((i & 0xFF) ^ 0xA5)
-
-        with open(out_dat_path, "wb") as fout:
-            fout.write(data)
-
-        return should_scramble
+        return out_dat_path, True
 
     def compile_csharp_sfx(self, csc_path: str, work_dir: str, payload_dat: str, scrambled: bool, seven_zip: str, target_exe: str) -> tuple[bool, str]:
         shutil.copy2(seven_zip, os.path.join(work_dir, "7z.exe"))
@@ -737,11 +1040,15 @@ class SFXBuilderWorker(QThread):
         source_folder_name = os.path.basename(src_norm) if os.path.isdir(src_norm) else ""
 
         def cs_escape(s: str) -> str:
-            return s.replace("\\", "\\\\").replace('"', '\\"')
+            return (
+                s.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\r", "\\r")
+                .replace("\n", "\\n")
+                .replace("\t", "\\t")
+            )
 
         prod_name_str = cs_escape(self.cfg["name"].strip() or "Byte Wrapper Package")
-        # Windows Explorer reads 'File description' from AssemblyTitle!
-        # If Description is provided, set AssemblyTitle & AssemblyDescription to Description.
         raw_desc = self.cfg["description"].strip()
         file_desc_str = cs_escape(raw_desc if raw_desc else (self.cfg["name"].strip() or "Byte Wrapper Package"))
 
@@ -754,7 +1061,18 @@ class SFXBuilderWorker(QThread):
         expected_user_pw = cs_escape(self.cfg["password"])
 
         is_scrambled = "true" if scrambled else "false"
+        # A transparent package stores its 7z archive ONLY as the final EXE
+        # overlay. Previously it was also embedded in the .NET resources,
+        # pushing the outer 7z signature past archive scanners' search limit.
+        overlay_archive_size = 0 if scrambled else os.path.getsize(payload_dat)
         hidden_run = "true" if self.cfg["hidden_run"] else "false"
+        # Only scripts that deliberately relaunch themselves for elevation
+        # need the wrapper to obtain normal UAC approval first.
+        hidden_script_needs_admin = "true" if (
+            self.cfg["hidden_run"]
+            and not self.cfg["run_as_admin"]
+            and self.cfg.get("self_elevating_run_file", False)
+        ) else "false"
         extract_only = "true" if self.cfg["extract_only"] else "false"
         instances = "true" if self.cfg["instances"] else "false"
         self_remove = "true" if self.cfg["self_remove"] else "false"
@@ -777,13 +1095,16 @@ class SFXBuilderWorker(QThread):
         with open(manifest_path, "w", encoding="utf-8") as f:
             f.write(manifest_xml)
 
-        cs_code = f"""
+        cs_code = rf"""
 using System;
 using System.IO;
 using System.Text;
 using System.Drawing;
 using System.Reflection;
 using System.Diagnostics;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("{file_desc_str}")]
@@ -804,17 +1125,81 @@ namespace ByteWrapperStub
         private static readonly bool ASK_USER_PW = {ask_user_pw};
         private static readonly string EXPECTED_USER_PW = "{expected_user_pw}";
         private static readonly bool IS_SCRAMBLED = {is_scrambled};
+        private static readonly long OVERLAY_ARCHIVE_SIZE = {overlay_archive_size}L;
         private static readonly bool HIDDEN_RUN = {hidden_run};
+        private static readonly bool HIDDEN_SCRIPT_NEEDS_ADMIN = {hidden_script_needs_admin};
         private static readonly bool EXTRACT_ONLY = {extract_only};
         private static readonly bool INSTANCES = {instances};
         private static readonly bool SELF_REMOVE = {self_remove};
         private static readonly bool SHOW_PROGRESS = {show_progress};
+
+        private const int STARTF_USESHOWWINDOW = 0x00000001;
+        private const short SW_HIDE = 0;
+        private const uint CREATE_NO_WINDOW = 0x08000000;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct STARTUPINFO
+        {{
+            public int cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public int dwX;
+            public int dwY;
+            public int dwXSize;
+            public int dwYSize;
+            public int dwXCountChars;
+            public int dwYCountChars;
+            public int dwFillAttribute;
+            public int dwFlags;
+            public short wShowWindow;
+            public short cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }}
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PROCESS_INFORMATION
+        {{
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public int dwProcessId;
+            public int dwThreadId;
+        }}
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcessW(
+            string lpApplicationName,
+            StringBuilder lpCommandLine,
+            IntPtr lpProcessAttributes,
+            IntPtr lpThreadAttributes,
+            bool bInheritHandles,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFO lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
 
         [STAThread]
         static void Main()
         {{
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            // An unelevated self-elevating CMD would create a second, visible
+            // console outside the hidden launcher. Ask Windows for UAC consent
+            // BEFORE the CMD runs. Existing administrative launches are unchanged.
+            if (HIDDEN_RUN && HIDDEN_SCRIPT_NEEDS_ADMIN && !IsRunningAsAdministrator())
+            {{
+                RelaunchPackageElevatedHidden();
+                return;
+            }}
 
             if (ASK_USER_PW)
             {{
@@ -830,13 +1215,13 @@ namespace ByteWrapperStub
 
             string targetDir = string.IsNullOrWhiteSpace(EXTRACT_TO)
                 ? Path.Combine(Path.GetTempPath(), "BytePkg_" + Guid.NewGuid().ToString("N").Substring(0, 8))
-                : Environment.ExpandEnvironmentVariables(EXTRACT_TO.Replace("/", "\\\\"));
+                : Environment.ExpandEnvironmentVariables(EXTRACT_TO.Replace("/", "\\"));
 
             if (!string.IsNullOrEmpty(SOURCE_FOLDER_NAME) && !string.IsNullOrEmpty(RUN_FILE))
             {{
-                string expandedRun = Environment.ExpandEnvironmentVariables(RUN_FILE.Replace("/", "\\\\"));
+                string expandedRun = Environment.ExpandEnvironmentVariables(RUN_FILE.Replace("/", "\\"));
                 string expectedSub = Path.Combine(targetDir, SOURCE_FOLDER_NAME);
-                if (expandedRun.StartsWith(expectedSub + "\\\\", StringComparison.OrdinalIgnoreCase) &&
+                if (expandedRun.StartsWith(expectedSub + "\\", StringComparison.OrdinalIgnoreCase) &&
                     !targetDir.EndsWith(SOURCE_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
                 {{
                     targetDir = expectedSub;
@@ -849,7 +1234,8 @@ namespace ByteWrapperStub
             }}
             catch (Exception ex)
             {{
-                MessageBox.Show("Failed to create target directory: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                if (!HIDDEN_RUN)
+                    MessageBox.Show("Failed to create target directory: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }}
 
@@ -872,16 +1258,20 @@ namespace ByteWrapperStub
 
                 ExtractResource("7z.exe", sevenZExe, false);
                 ExtractResourceIfExists("7z.dll", sevenZDll, false);
-                ExtractResource("payload.dat", archive7z, IS_SCRAMBLED);
+                if (IS_SCRAMBLED)
+                    ExtractResource("payload.dat", archive7z, true);
+                else
+                    ExtractOverlayArchive(archive7z);
 
                 Application.DoEvents();
 
                 StringBuilder args = new StringBuilder();
-                args.Append("x \\"" + archive7z + "\\" ");
-                args.Append("-o\\"" + targetDir + "\\" ");
+                args.Append("x \"" + archive7z + "\" ");
+                args.Append("-o\"" + targetDir + "\" ");
                 if (!string.IsNullOrEmpty(INTERNAL_7Z_PW))
                 {{
-                    args.Append("-p\\"" + INTERNAL_7Z_PW + "\\" ");
+                    string safePw = INTERNAL_7Z_PW.Replace("\"", "\\\"");
+                    args.Append("-p\"" + safePw + "\" ");
                 }}
                 args.Append(INSTANCES ? "-aos -y" : "-aoa -y");
 
@@ -894,10 +1284,14 @@ namespace ByteWrapperStub
 
                 using (Process p = Process.Start(psi7z))
                 {{
+                    if (p == null)
+                        throw new InvalidOperationException("7-Zip extractor could not start.");
                     while (!p.WaitForExit(50))
                     {{
                         Application.DoEvents();
                     }}
+                    if (p.ExitCode != 0)
+                        throw new InvalidDataException("7-Zip extraction failed with exit code " + p.ExitCode);
                 }}
 
                 if (progressForm != null)
@@ -912,6 +1306,13 @@ namespace ByteWrapperStub
                     ExecuteRunFile(targetDir);
                 }}
             }}
+            catch (Exception ex)
+            {{
+                if (!HIDDEN_RUN)
+                    MessageBox.Show("Package processing failed: " + ex.Message,
+                        "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }}
             finally
             {{
                 if (progressForm != null)
@@ -919,7 +1320,6 @@ namespace ByteWrapperStub
                     progressForm.Close();
                     progressForm.Dispose();
                 }}
-                TryDelete(Path.Combine(targetDir, "_byte_hidden.vbs"));
                 try {{ Directory.Delete(workTemp, true); }} catch {{ }}
             }}
 
@@ -929,26 +1329,66 @@ namespace ByteWrapperStub
             }}
         }}
 
+        private static bool IsRunningAsAdministrator()
+        {{
+            try
+            {{
+                WindowsIdentity identity = WindowsIdentity.GetCurrent();
+                WindowsPrincipal principal = new WindowsPrincipal(identity);
+                return principal.IsInRole(WindowsBuiltInRole.Administrator);
+            }}
+            catch (Exception)
+            {{
+                return false;
+            }}
+        }}
+
+        private static void RelaunchPackageElevatedHidden()
+        {{
+            try
+            {{
+                // The user must approve Windows' regular UAC prompt. No bypass.
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = Application.ExecutablePath;
+                psi.WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath);
+                psi.UseShellExecute = true;
+                psi.Verb = "runas";
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                using (Process process = Process.Start(psi))
+                {{
+                    // Dispose the launcher handle; the elevated package continues independently.
+                }}
+            }}
+            catch (Win32Exception)
+            {{
+                // UAC cancellation or launch failure: do not start visibly as a fallback.
+            }}
+            catch (Exception)
+            {{
+                // No log file is created.
+            }}
+        }}
+
         private static void ExecuteRunFile(string targetDir)
         {{
-            string rawCmd = Environment.ExpandEnvironmentVariables(RUN_FILE.Trim().Replace("/", "\\\\"));
+            string rawCmd = Environment.ExpandEnvironmentVariables(RUN_FILE.Trim().Replace("/", "\\"));
             string resolvedFile = "";
             string arguments = "";
 
-            if (File.Exists(rawCmd))
+            if (File.Exists(Path.Combine(targetDir, rawCmd)))
             {{
-                resolvedFile = rawCmd;
+                resolvedFile = Path.GetFullPath(Path.Combine(targetDir, rawCmd));
             }}
-            else if (File.Exists(Path.Combine(targetDir, rawCmd)))
+            else if (File.Exists(rawCmd))
             {{
-                resolvedFile = Path.Combine(targetDir, rawCmd);
+                resolvedFile = Path.GetFullPath(rawCmd);
             }}
             else
             {{
                 string candidatePath = rawCmd;
-                if (rawCmd.StartsWith("\\""))
+                if (rawCmd.StartsWith("\""))
                 {{
-                    int endQuote = rawCmd.IndexOf('\\"', 1);
+                    int endQuote = rawCmd.IndexOf('\"', 1);
                     if (endQuote > 1)
                     {{
                         candidatePath = rawCmd.Substring(1, endQuote - 1);
@@ -967,9 +1407,7 @@ namespace ByteWrapperStub
                             arguments = rawCmd.Substring(spaceIdx + 1).Trim();
                         }}
                     }}
-                    // Paths selected in the GUI may contain unquoted spaces.
-                    // Find the script extension before optional parameters.
-                    string[] knownExtensions = new string[] {{ ".bat", ".cmd", ".ps1", ".exe", ".reg" }};
+                    string[] knownExtensions = new string[] {{ ".bat", ".cmd", ".ps1", ".exe", ".msi", ".reg" }};
                     foreach (string knownExtension in knownExtensions)
                     {{
                         int extAt = rawCmd.IndexOf(knownExtension, StringComparison.OrdinalIgnoreCase);
@@ -984,13 +1422,13 @@ namespace ByteWrapperStub
                     }}
                 }}
 
-                if (File.Exists(candidatePath))
+                if (File.Exists(Path.Combine(targetDir, candidatePath)))
                 {{
-                    resolvedFile = candidatePath;
+                    resolvedFile = Path.GetFullPath(Path.Combine(targetDir, candidatePath));
                 }}
-                else if (File.Exists(Path.Combine(targetDir, candidatePath)))
+                else if (File.Exists(candidatePath))
                 {{
-                    resolvedFile = Path.Combine(targetDir, candidatePath);
+                    resolvedFile = Path.GetFullPath(candidatePath);
                 }}
                 else
                 {{
@@ -1000,7 +1438,7 @@ namespace ByteWrapperStub
                         string directMatch = Path.Combine(targetDir, fileNameOnly);
                         if (File.Exists(directMatch))
                         {{
-                            resolvedFile = directMatch;
+                            resolvedFile = Path.GetFullPath(directMatch);
                         }}
                         else
                         {{
@@ -1008,7 +1446,7 @@ namespace ByteWrapperStub
                             {{
                                 string[] found = Directory.GetFiles(targetDir, fileNameOnly, SearchOption.AllDirectories);
                                 if (found.Length > 0)
-                                    resolvedFile = found[0];
+                                    resolvedFile = Path.GetFullPath(found[0]);
                             }}
                             catch {{ }}
                         }}
@@ -1016,100 +1454,162 @@ namespace ByteWrapperStub
                 }}
             }}
 
+            // File.Exists can accept relative paths, but WorkingDirectory cannot be empty.
+            if (!string.IsNullOrEmpty(resolvedFile))
+                resolvedFile = Path.GetFullPath(resolvedFile);
             string workDir = !string.IsNullOrEmpty(resolvedFile)
                 ? Path.GetDirectoryName(resolvedFile)
-                : targetDir;
+                : Path.GetFullPath(targetDir);
+            if (string.IsNullOrEmpty(workDir))
+                workDir = Path.GetFullPath(targetDir);
 
-            string finalCmdLine = !string.IsNullOrEmpty(resolvedFile)
-                ? ("\\"" + resolvedFile + "\\"" + (string.IsNullOrEmpty(arguments) ? "" : " " + arguments))
-                : rawCmd;
+            string ext = !string.IsNullOrEmpty(resolvedFile)
+                ? Path.GetExtension(resolvedFile).ToLowerInvariant()
+                : "";
 
-            string lowerCmd = finalCmdLine.ToLowerInvariant();
-            string hiddenVbs = Path.Combine(targetDir, "_byte_hidden.vbs");
+            string fileNameToStart = "";
+            string argsToStart = "";
 
-            if (lowerCmd.EndsWith(".reg\\"") || lowerCmd.EndsWith(".reg") || lowerCmd.Contains("regedit"))
+            if (ext == ".reg" || rawCmd.IndexOf("regedit", StringComparison.OrdinalIgnoreCase) >= 0)
             {{
-                string regArgs = finalCmdLine;
-                if (!lowerCmd.Contains("regedit"))
-                    regArgs = (HIDDEN_RUN ? "/s " : "") + finalCmdLine;
-                else if (HIDDEN_RUN && !lowerCmd.Contains("/s"))
-                    regArgs = finalCmdLine.Replace("regedit.exe", "regedit.exe /s").Replace("regedit", "regedit /s");
-
-                ProcessStartInfo psiReg = new ProcessStartInfo("regedit.exe", regArgs);
-                psiReg.WorkingDirectory = workDir;
-                psiReg.UseShellExecute = false;
-                psiReg.CreateNoWindow = HIDDEN_RUN;
-                if (HIDDEN_RUN) psiReg.WindowStyle = ProcessWindowStyle.Hidden;
-                using (Process p = Process.Start(psiReg)) {{ if (p != null) p.WaitForExit(); }}
+                fileNameToStart = "regedit.exe";
+                if (!string.IsNullOrEmpty(resolvedFile))
+                {{
+                    argsToStart = (HIDDEN_RUN ? "/s " : "") + "\"" + resolvedFile + "\"" +
+                        (string.IsNullOrEmpty(arguments) ? "" : " " + arguments);
+                }}
+                else
+                {{
+                    argsToStart = rawCmd;
+                    if (HIDDEN_RUN && argsToStart.IndexOf("/s", StringComparison.OrdinalIgnoreCase) < 0)
+                        argsToStart = "/s " + argsToStart;
+                }}
+                RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
                 return;
             }}
 
-            if (!string.IsNullOrEmpty(resolvedFile) && resolvedFile.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase))
+            if (ext == ".ps1")
             {{
-                finalCmdLine = "powershell.exe -ExecutionPolicy Bypass -File " + finalCmdLine;
-            }}
-
-            if (!HIDDEN_RUN && !string.IsNullOrEmpty(resolvedFile) &&
-                resolvedFile.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-            {{
-                ProcessStartInfo psiExe = new ProcessStartInfo(resolvedFile, arguments);
-                psiExe.WorkingDirectory = workDir;
-                psiExe.UseShellExecute = true;
-                using (Process p = Process.Start(psiExe)) {{ if (p != null) p.WaitForExit(); }}
+                fileNameToStart = "powershell.exe";
+                argsToStart = "-NoProfile -NonInteractive -ExecutionPolicy Bypass " +
+                    (HIDDEN_RUN ? "-WindowStyle Hidden " : "") +
+                    "-File \"" + resolvedFile + "\"" +
+                    (string.IsNullOrEmpty(arguments) ? "" : " " + arguments);
+                RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
                 return;
             }}
 
-            if (HIDDEN_RUN)
+            if (ext == ".bat" || ext == ".cmd")
             {{
-                // Hand the script path (and any optional arguments) directly to
-                // the embedded ByteHidden.vbs; do NOT split cmd.exe /c into VBS args.
-                if (string.IsNullOrEmpty(resolvedFile) || !File.Exists(resolvedFile))
-                {{
-                    MessageBox.Show("Run File was not found: " + RUN_FILE,
-                        "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                fileNameToStart = "cmd.exe";
+                argsToStart = "/D /S /C \"\"" + resolvedFile + "\"" +
+                    (string.IsNullOrEmpty(arguments) ? "" : " " + arguments) + "\"";
+                RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
+                return;
+            }}
+
+            if (ext == ".msi")
+            {{
+                fileNameToStart = "msiexec.exe";
+                argsToStart = "/i \"" + resolvedFile + "\"" +
+                    (HIDDEN_RUN ? " /qn /norestart" : "") +
+                    (string.IsNullOrEmpty(arguments) ? "" : " " + arguments);
+                RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
+                return;
+            }}
+
+            if (!string.IsNullOrEmpty(resolvedFile) && File.Exists(resolvedFile))
+            {{
+                RunNativeProcess(resolvedFile, arguments, workDir, HIDDEN_RUN);
+                return;
+            }}
+
+            RunNativeProcess("cmd.exe", "/D /S /C \"cd /d \"" + workDir + "\" && " + rawCmd + "\"", workDir, HIDDEN_RUN);
+        }}
+
+        private static bool TryRunHiddenNative(string fileName, string arguments, string workDir)
+        {{
+            STARTUPINFO startup = new STARTUPINFO();
+            startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+            startup.dwFlags = STARTF_USESHOWWINDOW;
+            startup.wShowWindow = SW_HIDE;
+
+            string command = "\"" + fileName + "\"" +
+                (string.IsNullOrWhiteSpace(arguments) ? "" : " " + arguments);
+            StringBuilder commandBuffer = new StringBuilder(command);
+            PROCESS_INFORMATION processInfo;
+            bool started = CreateProcessW(null, commandBuffer, IntPtr.Zero, IntPtr.Zero,
+                false, CREATE_NO_WINDOW, IntPtr.Zero, workDir, ref startup, out processInfo);
+            if (!started)
+                return false;
+
+            // CreateProcessW succeeded: the child now runs independently.
+            // Close ONLY our process/thread handles. Closing these handles does
+            // not terminate the launched program or its child processes.
+            if (processInfo.hThread != IntPtr.Zero)
+                CloseHandle(processInfo.hThread);
+            if (processInfo.hProcess != IntPtr.Zero)
+                CloseHandle(processInfo.hProcess);
+            return true;
+        }}
+
+        private static void RunNativeProcess(string fileName, string arguments, string workDir, bool hidden)
+        {{
+            try
+            {{
+                // Apply Win32 STARTUPINFO.SW_HIDE and CREATE_NO_WINDOW together.
+                // ProcessStartInfo alone cannot provide both settings on all
+                // .NET Framework launch paths. This controls the initial
+                // process window; an app can still open its own windows.
+                if (hidden && TryRunHiddenNative(fileName, arguments, workDir))
                     return;
-                }}
-                string runExt = Path.GetExtension(resolvedFile).ToLowerInvariant();
-                if (runExt != ".bat" && runExt != ".cmd" && runExt != ".ps1")
+
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = fileName;
+                psi.Arguments = arguments;
+                psi.WorkingDirectory = workDir;
+                // Shell fallback supports manifests requiring elevation.
+                psi.UseShellExecute = hidden;
+                psi.CreateNoWindow = false;
+                psi.WindowStyle = hidden ? ProcessWindowStyle.Hidden : ProcessWindowStyle.Normal;
+
+                using (Process p = Process.Start(psi))
                 {{
-                    MessageBox.Show("Hidden Run supports .bat, .cmd and .ps1 files only.",
-                        "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
+                    // Dispose the launcher handle without waiting for the child.
+                    // The extracted Run File keeps running after this stub exits.
                 }}
-                if (!File.Exists(hiddenVbs))
+            }}
+            catch (Win32Exception ex)
+            {{
+                if (ex.NativeErrorCode == 740 && !hidden)
                 {{
-                    MessageBox.Show("ByteHidden.vbs was not included in the package.",
-                        "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }}
-                ProcessStartInfo psiVbs = new ProcessStartInfo();
-                psiVbs.FileName = "wscript.exe";
-                psiVbs.Arguments = "//nologo \\"" + hiddenVbs + "\\" \\"" + resolvedFile + "\\"" +
-                    (string.IsNullOrWhiteSpace(arguments) ? "" : " " + arguments);
-                psiVbs.WorkingDirectory = workDir;
-                psiVbs.UseShellExecute = false;
-                psiVbs.CreateNoWindow = true;
-                psiVbs.WindowStyle = ProcessWindowStyle.Hidden;
-                using (Process p = Process.Start(psiVbs))
-                {{
-                    if (p != null)
+                    try
                     {{
-                        p.WaitForExit();
-                        if (p.ExitCode != 0)
-                            MessageBox.Show("The script runner returned exit code " + p.ExitCode,
-                                "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        ProcessStartInfo elevated = new ProcessStartInfo();
+                        elevated.FileName = fileName;
+                        elevated.Arguments = arguments;
+                        elevated.WorkingDirectory = workDir;
+                        elevated.UseShellExecute = true;
+                        using (Process p = Process.Start(elevated))
+                        {{
+                            // UAC launch was accepted: the elevated child is independent.
+                        }}
+                    }}
+                    catch (Exception)
+                    {{
                     }}
                 }}
+                else if (!hidden)
+                {{
+                    MessageBox.Show("Failed to execute process: " + ex.Message,
+                        "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }}
             }}
-            else
+            catch (Exception ex)
             {{
-                ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = "cmd.exe";
-                psi.Arguments = "/c cd /d \\"" + workDir + "\\" && " + finalCmdLine;
-                psi.WorkingDirectory = workDir;
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = false;
-                using (Process p = Process.Start(psi)) {{ if (p != null) p.WaitForExit(); }}
+                if (!hidden)
+                    MessageBox.Show("Failed to execute process: " + ex.Message,
+                        "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }}
         }}
 
@@ -1120,7 +1620,7 @@ namespace ByteWrapperStub
                 string exePath = Application.ExecutablePath;
                 ProcessStartInfo psi = new ProcessStartInfo();
                 psi.FileName = "cmd.exe";
-                psi.Arguments = "/c :loop & del /f /q \\"" + exePath + "\\" >nul 2>&1 & if exist \\"" + exePath + "\\" (ping 127.0.0.1 -n 2 >nul & goto loop)";
+                psi.Arguments = "/D /C for /L %i in (1,1,15) do @(if exist \"" + exePath + "\" (del /f /q \"" + exePath + "\" >nul 2>&1 & if exist \"" + exePath + "\" ping 127.0.0.1 -n 2 >nul))";
                 psi.WorkingDirectory = Path.GetTempPath();
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
@@ -1130,9 +1630,39 @@ namespace ByteWrapperStub
             catch {{ }}
         }}
 
-        private static void TryDelete(string path)
+        private static void ExtractOverlayArchive(string outPath)
         {{
-            try {{ if (File.Exists(path)) File.Delete(path); }} catch {{ }}
+            if (OVERLAY_ARCHIVE_SIZE < 32L)
+                throw new InvalidDataException("No readable 7z overlay is configured.");
+
+            using (FileStream source = new FileStream(Application.ExecutablePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {{
+                if (source.Length < OVERLAY_ARCHIVE_SIZE)
+                    throw new InvalidDataException("The 7z overlay is missing or incomplete.");
+
+                long offset = source.Length - OVERLAY_ARCHIVE_SIZE;
+                source.Seek(offset, SeekOrigin.Begin);
+                byte[] magic = new byte[] {{ 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C }};
+                for (int i = 0; i < magic.Length; i++)
+                    if (source.ReadByte() != magic[i])
+                        throw new InvalidDataException("The 7z overlay signature is invalid.");
+                source.Seek(offset, SeekOrigin.Begin);
+
+                using (FileStream dest = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {{
+                    long remaining = OVERLAY_ARCHIVE_SIZE;
+                    byte[] buffer = new byte[65536];
+                    while (remaining > 0L)
+                    {{
+                        int want = (int)Math.Min((long)buffer.Length, remaining);
+                        int read = source.Read(buffer, 0, want);
+                        if (read <= 0)
+                            throw new EndOfStreamException("The 7z overlay ended early.");
+                        dest.Write(buffer, 0, read);
+                        remaining -= read;
+                    }}
+                }}
+            }}
         }}
 
         private static void ExtractResourceIfExists(string resName, string outPath, bool unscramble)
@@ -1150,26 +1680,29 @@ namespace ByteWrapperStub
             {{
                 if (s == null)
                     throw new Exception("Resource not found: " + resName);
-                byte[] buffer = new byte[s.Length];
-                int read = 0;
-                while (read < buffer.Length)
-                {{
-                    int r = s.Read(buffer, read, buffer.Length - read);
-                    if (r <= 0) break;
-                    read += r;
-                }}
 
-                if (unscramble)
+                byte[] key = Encoding.ASCII.GetBytes("byte_wrapper_secret_key_2026");
+                int klen = key.Length;
+                byte[] buffer = new byte[65536];
+                long totalOffset = 0;
+
+                using (FileStream fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {{
-                    byte[] key = Encoding.ASCII.GetBytes("byte_wrapper_secret_key_2026");
-                    int klen = key.Length;
-                    for (int i = 0; i < buffer.Length; i++)
+                    int read;
+                    while ((read = s.Read(buffer, 0, buffer.Length)) > 0)
                     {{
-                        buffer[i] = (byte)(buffer[i] ^ key[i % klen] ^ ((i & 0xFF) ^ 0xA5));
+                        if (unscramble)
+                        {{
+                            for (int i = 0; i < read; i++)
+                            {{
+                                long idx = totalOffset + i;
+                                buffer[i] = (byte)(buffer[i] ^ key[idx % klen] ^ ((idx & 0xFF) ^ 0xA5));
+                            }}
+                        }}
+                        fs.Write(buffer, 0, read);
+                        totalOffset += read;
                     }}
                 }}
-
-                File.WriteAllBytes(outPath, buffer);
             }}
         }}
 
@@ -1264,13 +1797,13 @@ namespace ByteWrapperStub
             "/optimize+",
             f"/out:{target_exe}",
             f"/win32manifest:{manifest_path}",
-            f'/resource:{payload_dat},payload.dat',
             f'/resource:{os.path.join(work_dir, "7z.exe")},7z.exe',
         ]
         if has_dll:
             csc_cmd.append(f'/resource:{os.path.join(work_dir, "7z.dll")},7z.dll')
+        if scrambled:
+            csc_cmd.append(f'/resource:{payload_dat},payload.dat')
 
-        # Always embed the selected icon or the internally drawn default box icon
         icon_ico = self.cfg.get("icon_ico", "")
         if not (icon_ico and os.path.isfile(icon_ico)):
             icon_ico = get_app_icon_path()
@@ -1283,70 +1816,84 @@ namespace ByteWrapperStub
         res = subprocess.run(csc_cmd, capture_output=True, text=True, creationflags=creation_flags)
         if res.returncode != 0 or not os.path.isfile(target_exe):
             return False, f"C# Stub Compilation Error:\n{res.stdout}\n{res.stderr}"
-        # Retain the exact generated C# for the header-logo SFX code viewer.
-        # Place it BEFORE the optional appended 7z archive so 7-Zip remains readable.
+
+        # Retain the generated C# for the header-logo SFX code viewer.
+        # The source preview MUST precede the overlay archive: the final
+        # OVERLAY_ARCHIVE_SIZE bytes are the raw, byte-identical .7z payload.
         with open(target_exe, 'ab') as output:
             output.write(b'\r\n;!@ByteWrapperSource@UTF-8!\r\n')
             output.write(cs_code.encode('utf-8'))
             output.write(b'\r\n;!@ByteWrapperSourceEnd@!\r\n')
+
         if not scrambled:
-            # 7-Zip can inspect a normal .7z appended to an executable.
+            # In transparent mode the archive is appended exactly once. The
+            # stub streams it back from the EXE's final bytes when launched.
             with open(payload_dat, "rb") as archive, open(target_exe, "ab") as output:
                 shutil.copyfileobj(archive, output)
+
         return True, target_exe
 
     def run(self):
+        work_dir = None
+        success = False
+        message = ""
         try:
             self.progress.emit(5)
             seven_zip = self.find_7zip()
             if not seven_zip:
-                self.finished.emit(False, "7-Zip (7z.exe) was not found! Please make sure 7-Zip is installed.")
+                message = "7-Zip (7z.exe) was not found! Please make sure 7-Zip is installed."
                 return
 
             csc_path = self.find_csc()
             if not csc_path:
-                self.finished.emit(False, "Windows .NET C# compiler (csc.exe) was not found!")
+                message = "Windows .NET C# compiler (csc.exe) was not found!"
                 return
 
             source_path = os.path.expandvars(self.cfg["source"].strip())
             if not os.path.exists(source_path):
-                self.finished.emit(False, f"Source Folder / File path does not exist:\n{source_path}")
+                message = f"Source Folder / File path does not exist:\n{source_path}"
                 return
 
             out_dir = os.path.expandvars(self.cfg["output"].strip())
             if not out_dir:
-                self.finished.emit(False, "Please specify a valid Output save path!")
+                message = "Please specify a valid Output save path!"
                 return
 
             target_exe = self.resolve_output_exe_path()
-            self.progress.emit(15)
+            self.progress.emit(20)
 
-            with tempfile.TemporaryDirectory(prefix="byte_wrapper_build_") as work_dir:
-                extra_files = self.generate_helper_scripts(work_dir)
-                self.progress.emit(25)
+            # No TemporaryDirectory finalizer: if an antivirus scanner briefly
+            # holds payload.dat, retry cleanup instead of raising at Python exit.
+            work_dir = tempfile.mkdtemp(prefix="byte_wrapper_build_")
+            raw_7z = os.path.join(work_dir, "raw_package.7z")
+            res_7z = self.build_7z_archive(seven_zip, source_path, raw_7z)
+            if res_7z.returncode != 0:
+                message = f"7-Zip Compression Error:\n{res_7z.stderr or res_7z.stdout}"
+                return
 
-                raw_7z = os.path.join(work_dir, "raw_package.7z")
-                res_7z = self.build_7z_archive(seven_zip, source_path, raw_7z, extra_files)
-                if res_7z.returncode != 0:
-                    self.finished.emit(False, f"7-Zip Compression Error:\n{res_7z.stderr or res_7z.stdout}")
-                    return
+            self.progress.emit(60)
+            scrambled_dat = os.path.join(work_dir, "payload.dat")
+            payload_path, scrambled = self.prepare_payload(raw_7z, scrambled_dat)
+            self.progress.emit(75)
 
-                self.progress.emit(60)
+            ok, msg = self.compile_csharp_sfx(csc_path, work_dir, payload_path,
+                                               scrambled, seven_zip, target_exe)
+            if not ok:
+                message = msg
+                return
 
-                payload_dat = os.path.join(work_dir, "payload.dat")
-                scrambled = self.obfuscate_payload(raw_7z, payload_dat)
-                self.progress.emit(75)
-
-                ok, msg = self.compile_csharp_sfx(csc_path, work_dir, payload_dat, scrambled, seven_zip, target_exe)
-                if not ok:
-                    self.finished.emit(False, msg)
-                    return
-
-                self.progress.emit(100)
-                self.finished.emit(True, f"Package successfully created at:\n{target_exe}")
+            self.progress.emit(100)
+            success = True
+            message = f"Package successfully created at:\n{target_exe}"
 
         except Exception as e:
-            self.finished.emit(False, f"Unexpected error: {str(e)}")
+            message = f"Unexpected error: {str(e)}"
+        finally:
+            if work_dir:
+                _remove_build_directory_safely(work_dir)
+            # Announce completion only AFTER source file handles close and
+            # transient build-directory cleanup has been attempted.
+            self.finished.emit(success, message)
 
 
 # ==========================================
@@ -1360,8 +1907,6 @@ class ByteWrapperWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.drag_pos = QPoint()
 
-        # Always use the internally drawn vector-style box icon as the default
-        # for the GUI and generated SFX files. Users can still override it later.
         self.app_icon_path = get_app_icon_path()
         if not self.app_icon_path or not os.path.isfile(self.app_icon_path):
             fallback_ico = os.path.join(tempfile.gettempdir(), "byte_wrapper_default_box.ico")
@@ -1371,14 +1916,15 @@ class ByteWrapperWindow(QWidget):
         self.current_icon_source = self.app_icon_path
         self.converted_ico_path = self.app_icon_path
 
-        # Keep the generated ICO for SFX compilation, but load its largest
-        # resolution into Qt for a sharp title logo, button, and taskbar icon.
-        self.default_gui_icon = load_crisp_gui_icon(self.app_icon_path)
+        dpr = max(1.0, self.devicePixelRatioF())
+        self.default_gui_icon = load_crisp_gui_icon(self.app_icon_path, dpr)
         self.setWindowIcon(self.default_gui_icon)
         if QApplication.instance():
             QApplication.instance().setWindowIcon(self.default_gui_icon)
 
         self._user_edited_name = False
+        self._tracked_source_path = ""
+        self._importing_config = False
         self._blink_timer = QTimer(self)
         self._blink_timer.timeout.connect(self._on_blink_step)
         self._blink_step_count = 0
@@ -1387,12 +1933,16 @@ class ByteWrapperWindow(QWidget):
         self.apply_styles()
 
     def _save_fallback_box_ico(self, out_ico: str):
-        """Create the internal vector-style default icon."""
         draw_default_sfx_icon(out_ico)
+
+    def _apply_icon_to_button(self, ico_path: str):
+        """Render the selected ICO onto the 24x24 button at exact physical screen DPI."""
+        dpr = max(1.0, self.devicePixelRatioF())
+        self.btn_icon.setIcon(load_crisp_gui_icon(ico_path, dpr))
+        self.btn_icon.setIconSize(QSize(24, 24))
 
     def init_ui(self):
         main_layout = QVBoxLayout(self)
-        # Uniform margins and spacing across the entire window
         main_layout.setContentsMargins(18, 14, 18, 18)
         main_layout.setSpacing(6)
 
@@ -1403,16 +1953,9 @@ class ByteWrapperWindow(QWidget):
 
         self.logo_label = SFXDropLogo(self)
         self.logo_label.fileDropped.connect(self.inspect_sfx_file)
-        # Scale from the 256px artwork (not a 16px ICO thumbnail). Render
-        # at the display's actual physical pixel density to avoid DPI blur.
         logo_dpr = max(1.0, self.devicePixelRatioF())
-        logo_size_px = max(36, round(36 * logo_dpr))
-        logo_pix = self.default_gui_icon.pixmap(QSize(256, 256)).scaled(
-            logo_size_px, logo_size_px,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        logo_pix.setDevicePixelRatio(logo_dpr)
+        master_parcel = _render_parcel_canvas(1024, stroke_scale=1.08)
+        logo_pix = pil_to_qpixmap(master_parcel, 36, logo_dpr)
         self.logo_label.setPixmap(logo_pix)
         self.logo_label.setFixedSize(36, 36)
         self.logo_label.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1447,28 +1990,24 @@ class ByteWrapperWindow(QWidget):
         main_layout.addLayout(header_layout)
 
         # --- FIRST SECTION: INPUT FIELDS ---
-        # Source Folder
         main_layout.addWidget(self._make_section_label("Source Folder"))
-        self.inp_source = SmartLineEdit("Select or drop and drop file or folder...", mode="source", parent_win=self)
+        self.inp_source = SmartLineEdit("Select or drag and drop file or folder...", mode="source", parent_win=self)
+        self.inp_source.textChanged.connect(self.on_source_path_changed)
         main_layout.addWidget(self.inp_source)
 
-        # Extract To
         main_layout.addWidget(self._make_section_label("Extract To"))
         self.inp_extract = SmartLineEdit("Define extraction path...", mode="extract_to", parent_win=self)
         main_layout.addWidget(self.inp_extract)
 
-        # Run File
         main_layout.addWidget(self._make_section_label("Run File"))
         self.inp_run = SmartLineEdit("Define run file path with parameters...", mode="run_file", parent_win=self)
         self.inp_run.textChanged.connect(self.on_run_file_changed)
         main_layout.addWidget(self.inp_run)
 
-        # Output
         main_layout.addWidget(self._make_section_label("Output"))
         self.inp_output = SmartLineEdit("Define save path...", mode="output", parent_win=self)
         main_layout.addWidget(self.inp_output)
 
-        # Name & Description
         main_layout.addWidget(self._make_section_label("Name & Description"))
         nd_layout = QHBoxLayout()
         nd_layout.setContentsMargins(0, 0, 0, 0)
@@ -1477,10 +2016,7 @@ class ByteWrapperWindow(QWidget):
         self.btn_icon = QPushButton()
         self.btn_icon.setObjectName("IconSelectBtn")
         self.btn_icon.setFixedSize(34, 34)
-        # Uses the embedded SFX Icon.ico by default until another is chosen
-        self.btn_icon.setIcon(self.default_gui_icon)
-        self.btn_icon.setIconSize(QSize(24, 24))
-        self.btn_icon.setToolTip("Click to choose icon options")
+        self._apply_icon_to_button(self.app_icon_path)
         self.btn_icon.clicked.connect(self.open_icon_menu)
         self.btn_icon.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.btn_icon.customContextMenuRequested.connect(self.reset_icon_to_default)
@@ -1500,7 +2036,7 @@ class ByteWrapperWindow(QWidget):
 
         main_layout.addLayout(nd_layout)
 
-        # --- SECOND SECTION: OPTIONS (Wrapper_3.png Layout) ---
+        # --- SECOND SECTION: OPTIONS ---
         main_layout.addWidget(self._make_section_label("Options"))
         opt_grid = QGridLayout()
         opt_grid.setContentsMargins(0, 2, 0, 4)
@@ -1510,19 +2046,16 @@ class ByteWrapperWindow(QWidget):
         opt_grid.setColumnStretch(1, 1)
         opt_grid.setColumnStretch(2, 1)
 
-        # Row 0: Run As Admin | Hidden Run | Don't Replace
         self.chk_admin = QCheckBox("Run As Admin")
         self.chk_hidden = QCheckBox("Hidden Run")
         self.chk_dont_replace = QCheckBox("Don't Replace")
 
-        # Row 1: Extract Only | Self Remove | Progress Bar
         self.chk_extract_only = QCheckBox("Extract Only")
         self.chk_extract_only.toggled.connect(self.on_extract_only_toggled)
         self.chk_hidden.toggled.connect(self.on_hidden_run_toggled)
         self.chk_self_remove = QCheckBox("Self Remove")
         self.chk_progress_bar = QCheckBox("Progress Bar")
 
-        # Row 2: Compress | Crypto | Instances
         self.chk_compress = QCheckBox("Compress")
         self.chk_crypto = QCheckBox("Crypto")
         self.chk_instances = QCheckBox("Instances")
@@ -1585,8 +2118,6 @@ class ByteWrapperWindow(QWidget):
         exp_imp_layout.addWidget(self.btn_import)
         left_bottom.addLayout(exp_imp_layout)
 
-        # Password is optional: a non-empty field enables protection automatically.
-        # Width matches the Export/Import row, filling the removed checkbox space.
         self.inp_password = QLineEdit()
         self.inp_password.setObjectName("PasswordInput")
         self.inp_password.setPlaceholderText("Password...")
@@ -1707,7 +2238,6 @@ class ByteWrapperWindow(QWidget):
                 background-color: #2563eb;
                 border: 1px solid #3b82f6;
             }
-            /* Alternative mode is muted, not disabled: click to switch. */
             QCheckBox[muted="true"] {
                 color: #475569;
             }
@@ -1785,9 +2315,7 @@ class ByteWrapperWindow(QWidget):
                 self.inspect_sfx_file(file_path)
             event.accept()
 
-
     def on_extract_only_toggled(self, checked: bool):
-        # Exclusive, but never disable the other checkbox: clicking it switches modes.
         if checked and self.chk_hidden.isChecked():
             self.chk_hidden.setChecked(False)
         self.inp_run.setEnabled(not checked)
@@ -1799,19 +2327,17 @@ class ByteWrapperWindow(QWidget):
         self._refresh_hidden_availability()
 
     def _refresh_hidden_availability(self):
-        """Slightly dim the opposite option, without disabling its mouse input."""
         extract_selected = self.chk_extract_only.isChecked()
         hidden_selected = self.chk_hidden.isChecked()
 
-        # Both remain enabled even if the run script has not yet been specified.
         self.chk_hidden.setEnabled(True)
         self.chk_extract_only.setEnabled(True)
 
         self._style_mutually_exclusive_option(self.chk_hidden, extract_selected)
         self._style_mutually_exclusive_option(self.chk_extract_only, hidden_selected)
         self.chk_hidden.setToolTip(
-            "Click to switch from Extract Only to Hidden Run. Supports BAT/CMD/PS1."
-            if extract_selected else "Run BAT/CMD/PS1 using the embedded VBScript."
+            "Click to switch from Extract Only to Hidden Run."
+            if extract_selected else "Hide the initial run window. An application may open its own visible windows."
         )
         self.chk_extract_only.setToolTip(
             "Click to switch from Hidden Run to Extract Only."
@@ -1826,6 +2352,79 @@ class ByteWrapperWindow(QWidget):
             checkbox.style().polish(checkbox)
             checkbox.update()
 
+    @staticmethod
+    def _normalize_source_path(path: str) -> str:
+        """Compare folder selections independently of trailing separators or letter case."""
+        path = path.strip().strip('"')
+        if not path:
+            return ""
+        expanded = os.path.expanduser(os.path.expandvars(path))
+        return os.path.normcase(os.path.abspath(os.path.normpath(expanded)))
+
+    def _clear_source_dependent_fields(self):
+        """A changed source invalidates the selected run command, name and custom icon."""
+        self._user_edited_name = False
+        self.inp_run.clear()
+        self.inp_name.clear()
+        self.reset_icon_to_default()
+
+    def on_source_path_changed(self, path: str):
+        """Handle manual edits and folder/file selections from the browse menu."""
+        normalized = self._normalize_source_path(path)
+        previous = self._tracked_source_path
+        self._tracked_source_path = normalized
+        if self._importing_config:
+            return
+        if normalized != previous:
+            self._clear_source_dependent_fields()
+
+    def on_source_dropped(self, path: str):
+        """On a new folder clear immediately; on the same folder recheck Run File."""
+        previous = self._tracked_source_path
+        normalized = self._normalize_source_path(path)
+        self.inp_source.setText(path)
+        # setText does not emit textChanged when the same folder is dropped twice.
+        if normalized == previous:
+            self._revalidate_run_file_in_source()
+
+    def _run_file_still_in_source(self) -> bool:
+        """Only accept actual files under the selected source, not PATH or unrelated folders."""
+        src = self._normalize_source_path(self.inp_source.text())
+        candidate = self._extract_candidate_from_run_text(self.inp_run.text()).strip().strip('"')
+        if not src or not candidate:
+            return False
+        candidate = os.path.expanduser(os.path.expandvars(candidate))
+        if not os.path.exists(src):
+            return False
+        if os.path.isfile(src):
+            candidate_path = candidate if os.path.isabs(candidate) else os.path.join(os.path.dirname(src), candidate)
+            return (os.path.isfile(candidate_path) and
+                    self._normalize_source_path(candidate_path) == src)
+
+        if not os.path.isdir(src):
+            return False
+        candidate_path = candidate if os.path.isabs(candidate) else os.path.join(src, candidate)
+        candidate_path = self._normalize_source_path(candidate_path)
+        try:
+            if os.path.commonpath((src, candidate_path)) != src:
+                return False
+        except ValueError:  # Different Windows drives
+            return False
+        if os.path.isfile(candidate_path):
+            return True
+
+        # A bare filename can be anywhere inside the source, matching the
+        # existing icon lookup and the generated launcher's recursive lookup.
+        if os.path.basename(candidate) == candidate and not os.path.isabs(candidate):
+            for folder, _, files in os.walk(src):
+                if any(name.casefold() == candidate.casefold() for name in files):
+                    return True
+        return False
+
+    def _revalidate_run_file_in_source(self):
+        if self.inp_run.text().strip() and not self._run_file_still_in_source():
+            self._clear_source_dependent_fields()
+
     def on_name_manually_edited(self, text: str):
         self._user_edited_name = bool(text.strip())
 
@@ -1836,14 +2435,12 @@ class ByteWrapperWindow(QWidget):
         if raw.startswith('"'):
             end_q = raw.find('"', 1)
             return raw[1:end_q] if end_q > 1 else raw.strip('"')
-        # A selected path can contain spaces without explicitly being quoted.
-        match = re.match(r'^(.+?\.(?:bat|cmd|ps1|exe|reg))(?=\s|$)', raw, re.IGNORECASE)
+        match = re.match(r'^(.+?\.(?:bat|cmd|ps1|exe|msi|reg))(?=\s|$)', raw, re.IGNORECASE)
         if match:
             return match.group(1)
         return raw.split()[0]
 
     def on_run_file_changed(self, text: str):
-        """Automatically populates the Name field with the Run File's filename without extension."""
         self._refresh_hidden_availability()
         raw = text.strip()
         if not raw:
@@ -1858,10 +2455,9 @@ class ByteWrapperWindow(QWidget):
             self.inp_name.setText(stem)
 
     def reset_icon_to_default(self, _pos=None):
-        """Restore the drawn default icon for GUI selection and built EXE."""
         self.current_icon_source = self.app_icon_path
         self.converted_ico_path = self.app_icon_path
-        self.btn_icon.setIcon(self.default_gui_icon)
+        self._apply_icon_to_button(self.app_icon_path)
         self.btn_icon.setToolTip('Default Byte Wrapper icon restored. Left-click to select another.')
         self.reset_start_status()
 
@@ -1902,7 +2498,6 @@ class ByteWrapperWindow(QWidget):
         if os.path.isfile(candidate):
             return candidate
 
-        # Check inside Source Folder
         src = os.path.expandvars(self.inp_source.text().strip().replace("/", "\\"))
         if os.path.isfile(src):
             return src
@@ -1917,7 +2512,6 @@ class ByteWrapperWindow(QWidget):
                         if f.lower() == fname.lower():
                             return os.path.join(root_dir, f)
 
-        # Check system PATH (e.g., cmd.exe, powershell.exe, regedit.exe)
         which_path = shutil.which(candidate) or shutil.which(os.path.basename(candidate))
         if which_path and os.path.isfile(which_path):
             return which_path
@@ -1934,7 +2528,7 @@ class ByteWrapperWindow(QWidget):
         if extract_icon_from_file(target_file, out_ico):
             self.current_icon_source = target_file
             self.converted_ico_path = out_ico
-            self.btn_icon.setIcon(load_crisp_gui_icon(out_ico))
+            self._apply_icon_to_button(out_ico)
             self.reset_start_status()
         else:
             self.btn_icon.setToolTip(f"Could not extract icon from: {target_file}")
@@ -1952,10 +2546,10 @@ class ByteWrapperWindow(QWidget):
         ext = os.path.splitext(file_path)[1].lower()
         out_ico = os.path.join(tempfile.gettempdir(), "byte_wrapper_selected_icon.ico")
 
-        if ext == ".exe":
+        if ext in (".exe", ".ico"):
             success = extract_icon_from_file(file_path, out_ico)
             if not success:
-                self.btn_icon.setToolTip("Could not extract icon from the selected .exe file.")
+                self.btn_icon.setToolTip("Could not extract icon from the selected file.")
                 return
         else:
             success = convert_image_to_ico(file_path, out_ico)
@@ -1965,12 +2559,11 @@ class ByteWrapperWindow(QWidget):
 
         self.current_icon_source = file_path
         self.converted_ico_path = out_ico
-        self.btn_icon.setIcon(load_crisp_gui_icon(out_ico))
+        self._apply_icon_to_button(out_ico)
         self.reset_start_status()
 
     # --- PASSWORD BLINK ANIMATION (5 TIMES ON IMPORT) ---
     def trigger_password_blink(self):
-        """Blinks the password text between plain text and hidden mode 5 times, then hides it."""
         self._blink_timer.stop()
         if not self.inp_password.text():
             self.inp_password.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1981,7 +2574,6 @@ class ByteWrapperWindow(QWidget):
 
     def _on_blink_step(self):
         self._blink_step_count += 1
-        # 5 full blinks = 10 transitions (Normal -> Password -> Normal ... -> Password)
         if self._blink_step_count >= 10:
             self._blink_timer.stop()
             self.inp_password.setEchoMode(QLineEdit.EchoMode.Password)
@@ -2017,7 +2609,6 @@ class ByteWrapperWindow(QWidget):
 
     def export_config(self):
         cfg = self.collect_config()
-        # Encrypt the password field before saving to JSON
         export_data = dict(cfg)
         export_data.pop("icon_ico", None)
         export_data["password"] = encrypt_password_for_export(cfg.get("password", ""))
@@ -2043,6 +2634,7 @@ class ByteWrapperWindow(QWidget):
             with open(open_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
 
+            self._importing_config = True
             self._user_edited_name = bool(cfg.get("name", "").strip())
             self.inp_source.setText(cfg.get("source", ""))
             self.inp_extract.setText(cfg.get("extract_to", ""))
@@ -2070,21 +2662,43 @@ class ByteWrapperWindow(QWidget):
             icon_src = cfg.get("icon_source", "")
             if icon_src and os.path.exists(icon_src):
                 out_ico = os.path.join(tempfile.gettempdir(), "byte_wrapper_selected_icon.ico")
-                if icon_src.lower().endswith(".exe"):
+                if icon_src.lower().endswith((".exe", ".ico")):
                     extract_icon_from_file(icon_src, out_ico)
                 else:
                     convert_image_to_ico(icon_src, out_ico)
                 if os.path.exists(out_ico):
                     self.current_icon_source = icon_src
                     self.converted_ico_path = out_ico
-                    self.btn_icon.setIcon(load_crisp_gui_icon(out_ico))
+                    self._apply_icon_to_button(out_ico)
             else:
                 self.current_icon_source = self.app_icon_path
                 self.converted_ico_path = self.app_icon_path
-                self.btn_icon.setIcon(self.default_gui_icon)
+                self._apply_icon_to_button(self.app_icon_path)
 
         except Exception as e:
             self.btn_import.setToolTip(f"Failed to import configuration: {e}")
+        finally:
+            self._importing_config = False
+
+    def _source_run_file_path(self) -> str:
+        """Resolve a selected run script inside Source Folder for a warning check."""
+        source = os.path.expandvars(self.inp_source.text().strip())
+        run = self._extract_candidate_from_run_text(self.inp_run.text()).strip().strip('"')
+        if not run or not source:
+            return ""
+        run = os.path.expandvars(run)
+        source_dir = source if os.path.isdir(source) else os.path.dirname(source)
+        if os.path.isabs(run) and os.path.isfile(run):
+            return run
+        possible = os.path.join(source_dir, run)
+        if os.path.isfile(possible):
+            return possible
+        # The launcher also supports a bare run filename under nested folders.
+        if os.path.basename(run) == run and os.path.isdir(source_dir):
+            for root, _, names in os.walk(source_dir):
+                if run in names:
+                    return os.path.join(root, run)
+        return ""
 
     def start_process(self):
         cfg = self.collect_config()
@@ -2094,7 +2708,8 @@ class ByteWrapperWindow(QWidget):
         if not cfg["output"].strip():
             self.btn_start.setToolTip("Please specify an Output save directory.")
             return
-
+        run_script_path = self._source_run_file_path()
+        cfg["self_elevating_run_file"] = _looks_like_self_elevating_script(run_script_path)
         self.btn_start.setEnabled(False)
         self.progress_bar.setValue(0)
 
