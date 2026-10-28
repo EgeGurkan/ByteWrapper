@@ -3468,7 +3468,7 @@ class ByteWrapperWindow(QWidget):
         self.inp_output = SmartLineEdit("Define save path...", mode="output", parent_win=self)
         main_layout.addWidget(self.inp_output)
 
-        main_layout.addWidget(self._make_section_label("Name, Description & Version"))
+        main_layout.addWidget(self._make_section_label("Icon, Name, Description, Version"))
         nd_layout = QHBoxLayout()
         nd_layout.setContentsMargins(0, 0, 0, 0)
         nd_layout.setSpacing(6)
