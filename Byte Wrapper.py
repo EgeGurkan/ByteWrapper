@@ -1,21 +1,31 @@
 import os
 import re
 import sys
+import glob
 import json
+import uuid
+import errno
 import struct
 import base64
 import hashlib
 import shutil
 import ctypes
+from ctypes import wintypes
 import subprocess
 import tempfile
+import threading
 import time
 import mmap
 import io
+from collections import deque
 from datetime import datetime
+from xml.sax.saxutils import escape as xml_escape
 
-# Don't Forget To Install Necessary Components
-# pip install PyQt6 Pillow pillow-jxl-plugin pywin32 pyinstaller
+# Support #
+# Update Python # py -m pip install --upgrade pip
+# Install Components # py -m pip install PyQt6 Pillow pillow-jxl-plugin pywin32 pyinstaller
+# Check Components # py -c "from PyQt6.QtWidgets import QApplication; from PIL import Image; import pillow_jxl, win32ui, win32gui, win32con; print('All dependencies OK')"
+# Compile # py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl --hidden-import win32ui --hidden-import win32gui --hidden-import win32con "Byte Wrapper.py"
 
 # Hide the console window immediately when launched via python.exe on Windows
 if os.name == "nt":
@@ -24,7 +34,7 @@ if os.name == "nt":
         if hwnd:
             ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
         # Ensure Windows Taskbar displays our custom icon instead of python.exe icon
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ByteWrapper.SFXConstructor.1.0")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ByteWrapper.SFXConstructor")
     except Exception:
         pass
 
@@ -46,9 +56,12 @@ def _show_uncaught_error(exc_type, exc_value, exc_tb):
 sys.excepthook = _show_uncaught_error
 
 
-from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, QSize, QTimer
+from PyQt6.QtCore import (
+    Qt, QPoint, QThread, pyqtSignal, QSize, QTimer, QUrl, QRegularExpression
+)
 from PyQt6.QtGui import (
-    QIcon, QPixmap, QDragEnterEvent, QDropEvent
+    QIcon, QPixmap, QDragEnterEvent, QDropEvent,
+    QDesktopServices, QRegularExpressionValidator
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -64,19 +77,344 @@ except ImportError:
 
 
 # ==========================================
+# WINDOWS API BINDINGS & VALIDATION HELPERS
+# ==========================================
+if os.name == "nt":
+    _win32_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    _win32_k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _win32_k32.OpenProcess.restype = wintypes.HANDLE
+
+    _win32_k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _win32_k32.GetExitCodeProcess.restype = wintypes.BOOL
+
+    _win32_k32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _win32_k32.CreateFileW.restype = wintypes.HANDLE
+
+    _win32_k32.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    _win32_k32.MoveFileExW.restype = wintypes.BOOL
+
+    _win32_k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _win32_k32.CloseHandle.restype = wintypes.BOOL
+
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+else:
+    _win32_k32 = None
+    _INVALID_HANDLE_VALUE = -1
+
+
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+    "COM\u00b9", "COM\u00b2", "COM\u00b3",
+    "LPT\u00b9", "LPT\u00b2", "LPT\u00b3",
+}
+
+_ILLEGAL_PATH_CHARS_RE = re.compile(r'[<>"|?*]')
+_BW_SOURCE_START_MARKER = b";!@ByteWrapperSource@UTF-8!"
+_BW_SOURCE_END_MARKER = b";!@ByteWrapperSourceEnd@!"
+_BW_HEADER_SCAN_LIMIT = 12 * 1024 * 1024  # Embedded C# source always precedes payload overlay (<12 MB)
+
+
+def _is_unc_or_drive_abs(raw_path: str) -> bool:
+    """Return True if raw_path (after env expansion) is a UNC path (\\\\server\\share) or drive-rooted path."""
+    if not raw_path:
+        return False
+    cleaned = raw_path.strip()
+    while len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ('"', "'"):
+        cleaned = cleaned[1:-1].strip()
+    if not cleaned:
+        return False
+    expanded = os.path.expanduser(os.path.expandvars(cleaned)).replace("/", "\\")
+    if expanded.startswith("\\\\"):
+        return True
+    if len(expanded) >= 2 and expanded[0].isalpha() and expanded[1] == ":":
+        return True
+    return False
+
+
+def _strip_relative_leading_slashes(path_str: str) -> str:
+    """Strip single leading slashes from a relative path while preserving UNC '\\\\server\\share' paths."""
+    if not path_str:
+        return ""
+    if _is_unc_or_drive_abs(path_str):
+        return normalize_user_path(path_str)
+    normed = normalize_user_path(path_str).replace("/", "\\")
+    if normed.startswith("\\\\"):
+        return normed
+    return normed.lstrip("\\")
+
+
+def normalize_user_path(raw_path: str) -> str:
+    """Strip quotes/spaces, expand environment and user variables, and normalize path separators."""
+    if not raw_path:
+        return ""
+    cleaned = raw_path.strip()
+    while len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ('"', "'"):
+        cleaned = cleaned[1:-1].strip()
+    if not cleaned:
+        return ""
+    expanded = os.path.expanduser(os.path.expandvars(cleaned))
+    normed = os.path.normpath(expanded)
+    # Preserve UNC double backslash if input was a UNC path
+    if expanded.replace("/", "\\").startswith("\\\\") and not normed.startswith("\\\\"):
+        normed = "\\" + normed.lstrip("\\")
+    return normed
+
+
+def paths_refer_to_same_location(path_a: str, path_b: str) -> bool:
+    """Return True if two paths resolve to the exact same file or directory on disk."""
+    norm_a = normalize_user_path(path_a)
+    norm_b = normalize_user_path(path_b)
+    if not norm_a or not norm_b:
+        return False
+    try:
+        if os.path.exists(norm_a) and os.path.exists(norm_b):
+            return os.path.samefile(norm_a, norm_b)
+    except OSError:
+        pass
+    real_a = os.path.normcase(os.path.realpath(os.path.abspath(norm_a)))
+    real_b = os.path.normcase(os.path.realpath(os.path.abspath(norm_b)))
+    return real_a == real_b
+
+
+def is_windows_reserved_name(name: str) -> bool:
+    """Return True if a file or folder name matches a Windows reserved device name (including CON.foo.bar)."""
+    if not name:
+        return False
+    cleaned = name.strip().rstrip(". ")
+    if not cleaned:
+        return False
+    stem = cleaned.split(".", 1)[0].strip().rstrip(". ").upper()
+    return stem in WINDOWS_RESERVED_NAMES
+
+
+def path_has_reserved_or_invalid_component(raw_path: str) -> bool:
+    """Return True if a path contains illegal characters or any reserved Windows device segment."""
+    if not raw_path:
+        return False
+    expanded = normalize_user_path(raw_path).replace("/", "\\")
+    _, tail = os.path.splitdrive(expanded)
+    if _ILLEGAL_PATH_CHARS_RE.search(tail) or ":" in tail:
+        return True
+    for part in tail.split("\\"):
+        part_clean = part.strip()
+        if not part_clean or part_clean in (".", ".."):
+            continue
+        if is_windows_reserved_name(part_clean):
+            return True
+    return False
+
+
+def is_valid_output_directory_path(raw_path: str) -> bool:
+    """Verify output path syntax, drive existence, and ensure it does not point to an existing file."""
+    norm_out = normalize_user_path(raw_path)
+    if not norm_out or path_has_reserved_or_invalid_component(norm_out):
+        return False
+    if os.path.isfile(norm_out):
+        return False
+    drive, _ = os.path.splitdrive(norm_out)
+    if drive and not drive.startswith("\\\\"):
+        drive_root = drive + "\\"
+        if not os.path.exists(drive_root):
+            return False
+    return True
+
+
+def is_valid_version_string(raw_ver: str) -> bool:
+    """Validate version string using strict ASCII digits so values like 'abc123' or '1.²' are rejected."""
+    cleaned = (raw_ver or "").strip()
+    if not cleaned:
+        return True
+    parts = cleaned.split(".")
+    if not (1 <= len(parts) <= 4):
+        return False
+    for part in parts:
+        if len(part) > 5 or not re.fullmatch(r"[0-9]+", part):
+            return False
+        val = int(part)
+        if not (0 <= val <= 65534):
+            return False
+    return True
+
+
+def _normalize_pe_version(raw_ver: str) -> tuple[str, str]:
+    """Return (numeric_4_part_version, informational_version) for C# Assembly attributes."""
+    cleaned = (raw_ver or "").strip()
+    if not cleaned or not is_valid_version_string(cleaned):
+        return "1.0.0.0", "1.0.0.0"
+    nums = [int(p) for p in cleaned.split(".")[:4]]
+    while len(nums) < 4:
+        nums.append(0)
+    clamped = [str(min(65534, max(0, x))) for x in nums]
+    return ".".join(clamped), cleaned
+
+
+def _is_byte_wrapper_sfx_file(file_path: str) -> bool:
+    """Fast check for Byte Wrapper SFX signature within the initial stub header (<12 MB)."""
+    try:
+        if not file_path or not os.path.isfile(file_path):
+            return False
+        size = os.path.getsize(file_path)
+        if size < 64:
+            return False
+        scan_len = min(size, _BW_HEADER_SCAN_LIMIT)
+        with open(file_path, "rb") as f, mmap.mmap(f.fileno(), scan_len, access=mmap.ACCESS_READ) as data:
+            start_idx = data.find(_BW_SOURCE_START_MARKER)
+            if start_idx < 0:
+                return False
+            end_idx = data.find(_BW_SOURCE_END_MARKER, start_idx + len(_BW_SOURCE_START_MARKER))
+            return end_idx > start_idx
+    except Exception:
+        return False
+
+
+def _is_pid_running(pid: int) -> bool:
+    """Return True if a process with the given PID is currently active."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt" and _win32_k32 is not None:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+
+        ctypes.set_last_error(0)
+        handle = _win32_k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            return err == ERROR_ACCESS_DENIED
+        try:
+            exit_code = wintypes.DWORD(0)
+            if _win32_k32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return exit_code.value == STILL_ACTIVE
+            return True
+        finally:
+            _win32_k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _is_file_in_use(file_path: str) -> bool:
+    """Check if a file is currently open by any process on Windows using exclusive sharing."""
+    if not file_path or not os.path.isfile(file_path):
+        return False
+    if os.name == "nt" and _win32_k32 is not None:
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_NONE = 0x00000000
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        ERROR_FILE_NOT_FOUND = 2
+        ERROR_PATH_NOT_FOUND = 3
+
+        ctypes.set_last_error(0)
+        handle = _win32_k32.CreateFileW(
+            file_path,
+            GENERIC_READ,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            if err in (ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND):
+                return False
+            return True
+        _win32_k32.CloseHandle(handle)
+        return False
+    return False
+
+
+def cleanup_stale_temp_files(max_age_seconds: int = 3600, protected_paths: set[str] | None = None):
+    """Remove old preview text files and stale session icons only if they are not in use."""
+    temp_dir = tempfile.gettempdir()
+    now = time.time()
+    current_pid = os.getpid()
+
+    protected_norm = set()
+    if protected_paths:
+        for p in protected_paths:
+            if p:
+                protected_norm.add(os.path.normcase(os.path.abspath(p)))
+
+    # 1. Clean old preview text files that are not open/in-use
+    for path in glob.glob(os.path.join(temp_dir, "byte_wrapper_code_*.txt")):
+        try:
+            norm_p = os.path.normcase(os.path.abspath(path))
+            if norm_p in protected_norm:
+                continue
+            last_touch = max(os.path.getmtime(path), os.path.getatime(path))
+            if now - last_touch > max_age_seconds and not _is_file_in_use(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+    # 2. Clean session icon files only if their owning PID is no longer running and file is not in use
+    icon_pid_re = re.compile(r"^byte_wrapper_selected_icon_(\d+)(?:_[0-9a-f]+)?\.ico$", re.IGNORECASE)
+    for path in glob.glob(os.path.join(temp_dir, "byte_wrapper_selected_icon_*.ico")):
+        try:
+            norm_p = os.path.normcase(os.path.abspath(path))
+            if norm_p in protected_norm:
+                continue
+            fname = os.path.basename(path)
+            m = icon_pid_re.match(fname)
+            if m:
+                owner_pid = int(m.group(1))
+                if owner_pid == current_pid or _is_pid_running(owner_pid):
+                    continue
+            elif now - os.path.getmtime(path) <= max_age_seconds:
+                continue
+
+            if not _is_file_in_use(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def open_with_default_viewer(file_path: str) -> bool:
+    """Open a file or folder with the operating system's default handler (no notepad dependency)."""
+    norm_path = os.path.normpath(file_path)
+    if hasattr(os, "startfile"):
+        try:
+            os.startfile(norm_path)
+            return True
+        except OSError:
+            pass
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(norm_path))
+
+
+# ==========================================
 # SFX CONFIG READER
 # ==========================================
 def process_file(file_path):
-    """Open real 7-Zip SFX configs or Byte Wrapper's embedded C# source in Notepad.
+    """Open real 7-Zip SFX configs or Byte Wrapper's embedded C# source in the default viewer.
 
-    This is inspection only: changes saved in Notepad do not change the EXE.
+    This is inspection only: changes saved in the editor do not change the EXE.
     The file itself is never executed.
     Returns a (success, explanation) tuple for the GUI.
     """
+    cleanup_stale_temp_files()
     sources = (
         (b';!@Install@!UTF-8!', b';!@InstallEnd@!', '7-Zip SFX config'),
         (b';!@Install@!', b';!@InstallEnd@!', '7-Zip SFX config'),
-        (b';!@ByteWrapperSource@UTF-8!', b';!@ByteWrapperSourceEnd@!',
+        (_BW_SOURCE_START_MARKER, _BW_SOURCE_END_MARKER,
          'Byte Wrapper generated C# source'),
     )
     try:
@@ -114,7 +452,9 @@ def process_file(file_path):
             output.write('=' * 60 + '\n\n')
             output.write(content)
             output_file = output.name
-        subprocess.Popen(['notepad.exe', output_file])
+
+        if not open_with_default_viewer(output_file):
+            return False, 'Unable to open the default text viewer for the extracted configuration.'
         return True, output_file
     except Exception as exc:
         return False, f'Unable to open SFX code: {exc}'
@@ -123,7 +463,7 @@ def process_file(file_path):
 # ==========================================
 # PASSWORD ENCRYPTION FOR EXPORT / IMPORT
 # ==========================================
-SECRET_EXPORT_KEY = b"ByteWrapper_Config_Cipher_Key_2026"
+SECRET_EXPORT_KEY = b"ByteWrapper_Config_Cipher_Key"
 
 
 def encrypt_password_for_export(plain_text: str) -> str:
@@ -159,16 +499,9 @@ def decrypt_password_from_import(cipher_text: str) -> str:
 # ==========================================
 def save_crisp_multi_ico(master_img: Image.Image, out_ico_path: str,
                          sizes=(256, 128, 64, 48, 32, 24, 16)) -> bool:
-    """Build a multi-resolution Windows ICO with LANCZOS resampling per layer.
-
-    Unlike Pillow's default single-image ICO writer, this resamples every layer
-    directly from the high-resolution master image, applies subtle edge sharpening
-    for small icon sizes, and writes a PNG frame for 256x256 plus 32-bit BGRA DIB
-    frames for smaller sizes (ordered largest-first).
-    """
+    """Build a multi-resolution Windows ICO with LANCZOS resampling per layer."""
     try:
         src = master_img.convert("RGBA")
-        # Ensure square canvas while preserving aspect ratio
         if src.width != src.height:
             side = max(src.width, src.height)
             square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
@@ -194,12 +527,12 @@ def save_crisp_multi_ico(master_img: Image.Image, out_ico_path: str,
                 and_mask = b"\x00" * (and_row_bytes * sz)
                 bmp_header = struct.pack(
                     "<IIIHHIIIIII",
-                    40,                        # biSize
-                    sz,                        # biWidth
-                    sz * 2,                    # biHeight (XOR + AND)
-                    1,                         # biPlanes
-                    32,                        # biBitCount
-                    0,                         # biCompression (BI_RGB)
+                    40,
+                    sz,
+                    sz * 2,
+                    1,
+                    32,
+                    0,
                     len(xor_mask) + len(and_mask),
                     0, 0, 0, 0
                 )
@@ -272,7 +605,7 @@ def draw_default_sfx_icon(out_ico_path: str) -> None:
 
 def get_app_icon_path() -> str:
     """Return a reusable, drawn default ICO without unpacking embedded data."""
-    icon_path = os.path.join(tempfile.gettempdir(), "byte_wrapper_vector_box_v4.ico")
+    icon_path = os.path.join(tempfile.gettempdir(), "byte_wrapper_vector_box.ico")
     if os.path.isfile(icon_path) and os.path.getsize(icon_path) > 4096:
         return icon_path
     try:
@@ -289,6 +622,12 @@ def get_app_icon_path() -> str:
     except (OSError, ValueError) as exc:
         print("Unable to create drawn icon:", exc, file=sys.stderr)
         return ""
+
+
+def create_unique_temp_icon_path() -> str:
+    """Return a unique temporary ICO path per icon selection tied to the current PID."""
+    unique_id = uuid.uuid4().hex[:8]
+    return os.path.join(tempfile.gettempdir(), f"byte_wrapper_selected_icon_{os.getpid()}_{unique_id}.ico")
 
 
 def load_best_pil_from_ico(ico_path: str) -> Image.Image | None:
@@ -313,16 +652,12 @@ def load_best_pil_from_ico(ico_path: str) -> Image.Image | None:
                         candidates.append((real_w * real_h, bpp, i, offset, size, data[offset:offset + size]))
 
                 candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-                for _, _, _, offset, size, chunk in candidates:
+                for _, _, idx, offset, size, chunk in candidates:
                     if chunk.startswith(b"\x89PNG\r\n\x1a\n"):
                         with Image.open(io.BytesIO(chunk)) as png_img:
                             return png_img.convert("RGBA")
-                    # Reconstruct a single-entry ICO in memory so Pillow decodes this exact layer
-                    single_dir = bytearray(data[6:22])
-                    for _, _, idx, _, _, _ in candidates:
-                        pos = 6 + idx * 16
-                        single_dir = bytearray(data[pos:pos + 16])
-                        break
+                    pos = 6 + idx * 16
+                    single_dir = bytearray(data[pos:pos + 16])
                     struct.pack_into("<I", single_dir, 12, 22)
                     single_ico = struct.pack("<HHH", 0, 1, 1) + bytes(single_dir) + chunk
                     try:
@@ -385,7 +720,7 @@ def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0) -> bytes:
     if os.name != "nt" or not pe_path or not os.path.isfile(pe_path):
         return b""
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
     kernel32.LoadLibraryExW.restype = ctypes.c_void_p
     kernel32.FreeLibrary.argtypes = [ctypes.c_void_p]
@@ -415,6 +750,10 @@ def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0) -> bytes:
         ENUMRESNAMEPROCW = ctypes.WINFUNCTYPE(
             ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ssize_t
         )
+        kernel32.EnumResourceNamesW.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ENUMRESNAMEPROCW, ctypes.c_ssize_t
+        ]
+        kernel32.EnumResourceNamesW.restype = ctypes.c_int
 
         def _enum_cb(_hModule, _lpszType, lpszName, _lParam):
             if not lpszName:
@@ -443,10 +782,12 @@ def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0) -> bytes:
             target_id = group_ids[idx]
 
         def _find_and_read(res_type: int, res_id) -> bytes:
+            str_buf = None
             if isinstance(res_id, int):
                 name_ptr = ctypes.c_void_p(res_id)
             else:
-                name_ptr = ctypes.cast(ctypes.c_wchar_p(res_id), ctypes.c_void_p)
+                str_buf = ctypes.c_wchar_p(res_id)
+                name_ptr = ctypes.cast(str_buf, ctypes.c_void_p)
             hres = kernel32.FindResourceW(hmod, name_ptr, ctypes.c_void_p(res_type))
             if not hres:
                 return b""
@@ -489,7 +830,6 @@ def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0) -> bytes:
         out_payloads = bytearray()
 
         for entry_12, chunk in valid_layers:
-            # Update dwBytesInRes with exact chunk size and append 4-byte file offset
             fixed_12 = entry_12[:8] + struct.pack("<I", len(chunk))
             out_dir.extend(fixed_12)
             out_dir.extend(struct.pack("<I", offset))
@@ -519,7 +859,6 @@ def _resolve_associated_icon_source(file_path: str) -> tuple[str, int]:
         if os.path.isfile(bin_path):
             return bin_path, idx
 
-    # Query Windows Shell file association DefaultIcon
     try:
         ASSOCSTR_DEFAULTICON = 15
         buf = ctypes.create_unicode_buffer(512)
@@ -562,7 +901,6 @@ def extract_icon_from_file(file_path: str, out_ico_path: str) -> bool:
 
     target_bin, icon_idx = _resolve_associated_icon_source(file_path)
 
-    # 1. Try direct lossless PE resource extraction (plus Windows 10/11 .mun resource store)
     candidates_to_try = [target_bin]
     sys_root = os.environ.get("SystemRoot", r"C:\Windows")
     mun_candidate = os.path.join(sys_root, "SystemResources", os.path.basename(target_bin) + ".mun")
@@ -575,25 +913,41 @@ def extract_icon_from_file(file_path: str, out_ico_path: str) -> bool:
             try:
                 with open(out_ico_path, "wb") as f:
                     f.write(ico_bytes)
-                # Verify and normalize if needed
                 best_pil = load_best_pil_from_ico(out_ico_path)
                 if best_pil is not None and best_pil.width >= 48:
                     return True
             except OSError:
                 pass
 
-    # 2. Fallback: Use PrivateExtractIconsW with a 32-bit RGBA DIBSection
     try:
         import win32ui
         import win32gui
         import win32con
 
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+        user32.PrivateExtractIconsW.argtypes = [
+            wintypes.LPCWSTR, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+            ctypes.c_uint, ctypes.c_uint,
+        ]
+        user32.PrivateExtractIconsW.restype = ctypes.c_uint
+
+        user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+        user32.DestroyIcon.restype = wintypes.BOOL
+
+        shell32.ExtractAssociatedIconW.argtypes = [
+            wintypes.HINSTANCE, wintypes.LPWSTR, ctypes.POINTER(wintypes.WORD)
+        ]
+        shell32.ExtractAssociatedIconW.restype = ctypes.c_void_p
+
         hicon = 0
         for candidate in candidates_to_try:
             phicon = (ctypes.c_void_p * 1)()
             piconid = (ctypes.c_uint * 1)()
-            count = ctypes.windll.user32.PrivateExtractIconsW(
-                ctypes.c_wchar_p(candidate), icon_idx, 256, 256,
+            count = user32.PrivateExtractIconsW(
+                candidate, icon_idx, 256, 256,
                 phicon, piconid, 1, 0
             )
             if count > 0 and phicon[0]:
@@ -602,8 +956,8 @@ def extract_icon_from_file(file_path: str, out_ico_path: str) -> bool:
 
         if not hicon:
             buf = ctypes.create_unicode_buffer(file_path, 260)
-            pi_icon = ctypes.c_uint16(0)
-            hicon = ctypes.windll.shell32.ExtractAssociatedIconW(0, buf, ctypes.byref(pi_icon))
+            pi_icon = wintypes.WORD(0)
+            hicon = shell32.ExtractAssociatedIconW(None, buf, ctypes.byref(pi_icon))
 
         if not hicon:
             return False
@@ -635,7 +989,7 @@ def extract_icon_from_file(file_path: str, out_ico_path: str) -> bool:
             hdc_mem.DeleteDC()
             hdc_screen.DeleteDC()
             win32gui.ReleaseDC(0, screen_dc)
-            ctypes.windll.user32.DestroyIcon(hicon)
+            user32.DestroyIcon(ctypes.c_void_p(hicon))
     except Exception:
         return False
 
@@ -650,6 +1004,123 @@ def convert_image_to_ico(src_path: str, out_ico_path: str) -> bool:
             return save_crisp_multi_ico(img.convert("RGBA"), out_ico_path)
     except Exception:
         return False
+
+
+def _split_command_and_args(raw: str, source_path: str = "") -> tuple[str, str]:
+    """Split a command line into (executable_or_script_path, arguments_string).
+
+    When unquoted paths contain spaces (and even folder names ending with .exe),
+    evaluates candidate extension boundaries from longest to shortest against the
+    filesystem/source_path before falling back to the first extension boundary.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", ""
+    if s.startswith('"'):
+        end_q = s.find('"', 1)
+        if end_q > 1:
+            return s[1:end_q].strip(), s[end_q + 1:].strip()
+        return s.strip('"').strip(), ""
+
+    ext_matches = list(re.finditer(r'\.(?:bat|cmd|ps1|exe|msi|reg)(?=\s|$)', s, re.IGNORECASE))
+    if ext_matches:
+        if len(ext_matches) > 1:
+            src_norm = normalize_user_path(source_path) if source_path else ""
+            src_dir = (
+                src_norm if (src_norm and os.path.isdir(src_norm))
+                else (os.path.dirname(src_norm) if src_norm else "")
+            )
+            for m in reversed(ext_matches):
+                cand = s[:m.end()].strip()
+                norm_cand = _strip_relative_leading_slashes(cand)
+                if os.path.isfile(norm_cand):
+                    return cand, s[m.end():].strip()
+                if src_dir and not _is_unc_or_drive_abs(cand):
+                    if os.path.isfile(os.path.join(src_dir, norm_cand)):
+                        return cand, s[m.end():].strip()
+        first_m = ext_matches[0]
+        return s[:first_m.end()].strip(), s[first_m.end():].strip()
+
+    parts = s.split(None, 1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1].strip()
+
+
+def _resolve_unique_run_file_in_source(source_path: str, raw_run_text: str) -> str:
+    """Resolve Run File inside Source Folder unambiguously (including full UNC paths).
+
+    If a bare filename (e.g. 'app.exe') matches multiple files in subdirectories
+    (such as 'Client\\app.exe' and 'Server\\app.exe'), return '' so an explicit
+    relative path is required.
+    """
+    src = normalize_user_path(source_path)
+    cmd_part, _ = _split_command_and_args(raw_run_text, src)
+    if not src or not cmd_part or not os.path.exists(src):
+        return ""
+
+    raw_cmd_clean = cmd_part.strip().strip('"')
+    is_abs_or_unc = _is_unc_or_drive_abs(raw_cmd_clean)
+    candidate = normalize_user_path(raw_cmd_clean) if is_abs_or_unc else _strip_relative_leading_slashes(raw_cmd_clean)
+    if not candidate:
+        return ""
+
+    if os.path.isfile(src):
+        candidate_path = candidate if is_abs_or_unc else os.path.join(os.path.dirname(src), candidate)
+        if os.path.isfile(candidate_path) and paths_refer_to_same_location(candidate_path, src):
+            return os.path.abspath(src)
+        return ""
+
+    if not os.path.isdir(src):
+        return ""
+
+    src_real = os.path.normcase(os.path.realpath(os.path.abspath(src)))
+
+    # 1. Explicit absolute or UNC path: verify it is inside src and is an existing file
+    if is_abs_or_unc:
+        cand_real = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+        try:
+            if os.path.commonpath((src_real, cand_real)) == src_real and os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+        except ValueError:
+            pass
+        return ""
+
+    has_explicit_rel_sep = "\\" in raw_cmd_clean.replace("/", "\\").lstrip("\\")
+    src_folder_name = os.path.basename(os.path.normpath(src))
+    stripped_candidate = candidate
+    if src_folder_name and stripped_candidate.lower().startswith(src_folder_name.lower() + "\\"):
+        stripped_candidate = stripped_candidate[len(src_folder_name) + 1:].lstrip("\\")
+
+    # 2. Explicit relative path with directory separator (e.g. 'Client\app.exe' or '.\app.exe')
+    if has_explicit_rel_sep or "\\" in stripped_candidate:
+        for rel_try in (candidate, stripped_candidate):
+            if not rel_try:
+                continue
+            cand_path = os.path.join(src, rel_try)
+            cand_real = os.path.normcase(os.path.realpath(os.path.abspath(cand_path)))
+            try:
+                if os.path.commonpath((src_real, cand_real)) == src_real and os.path.isfile(cand_path):
+                    return os.path.abspath(cand_path)
+            except ValueError:
+                pass
+        return ""
+
+    # 3. Bare filename without directory separator (e.g. 'app.exe'): must be unique across the source tree
+    target_cf = stripped_candidate.casefold()
+    matches: list[str] = []
+    for folder, _, files in os.walk(src):
+        for fname in files:
+            if (fname.startswith(".bw_staging_") and fname.endswith(".tmp")) or fname.endswith(".bw_res"):
+                continue
+            if fname.casefold() == target_cf:
+                matches.append(os.path.abspath(os.path.join(folder, fname)))
+                if len(matches) > 1:
+                    return ""
+
+    if len(matches) == 1:
+        return matches[0]
+    return ""
 
 
 # ==========================================
@@ -702,6 +1173,34 @@ class SmartLineEdit(QLineEdit):
         """)
         return menu
 
+    def _format_run_file_selection(self, file_path: str) -> str:
+        """Convert selected/dropped run file path to an unambiguous relative path inside Source."""
+        norm_file = normalize_user_path(file_path)
+        start_dir = ""
+        if self.parent_win:
+            src = normalize_user_path(self.parent_win.inp_source.text())
+            if os.path.isdir(src):
+                start_dir = src
+            elif os.path.isfile(src):
+                start_dir = os.path.dirname(src)
+
+        if start_dir:
+            try:
+                norm_file_real = os.path.normcase(os.path.realpath(os.path.abspath(norm_file)))
+                start_real = os.path.normcase(os.path.realpath(os.path.abspath(start_dir)))
+                if os.path.commonpath((start_real, norm_file_real)) == start_real:
+                    rel_path = os.path.relpath(
+                        os.path.realpath(os.path.abspath(norm_file)),
+                        os.path.realpath(os.path.abspath(start_dir)),
+                    )
+                    if "\\" not in rel_path and "/" not in rel_path and os.path.isdir(start_dir):
+                        if not _resolve_unique_run_file_in_source(start_dir, rel_path):
+                            return f".\\{rel_path}"
+                    return rel_path
+            except ValueError:
+                pass
+        return norm_file
+
     def open_selector(self):
         if not self.isEnabled():
             return
@@ -717,11 +1216,11 @@ class SmartLineEdit(QLineEdit):
             if action == act_folder:
                 folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
                 if folder:
-                    self.setText(os.path.normpath(folder))
+                    self.setText(normalize_user_path(folder))
             elif action == act_file:
                 file_path, _ = QFileDialog.getOpenFileName(self, "Select Source File")
                 if file_path:
-                    self.setText(os.path.normpath(file_path))
+                    self.setText(normalize_user_path(file_path))
             elif action == act_manual:
                 self.setFocus()
 
@@ -737,7 +1236,7 @@ class SmartLineEdit(QLineEdit):
             if action == act_folder:
                 folder = QFileDialog.getExistingDirectory(self, "Select Extraction Folder")
                 if folder:
-                    self.setText(os.path.normpath(folder))
+                    self.setText(normalize_user_path(folder))
             elif action == act_temp:
                 self.setText("%Temp%")
             elif action == act_sysdrive:
@@ -757,7 +1256,7 @@ class SmartLineEdit(QLineEdit):
             if action == act_folder:
                 folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
                 if folder:
-                    self.setText(os.path.normpath(folder))
+                    self.setText(normalize_user_path(folder))
             elif action == act_desktop:
                 self.setText("%UserProfile%\\Desktop")
             elif action == act_manual:
@@ -772,7 +1271,7 @@ class SmartLineEdit(QLineEdit):
             if action == act_file:
                 start_dir = ""
                 if self.parent_win:
-                    src = os.path.expandvars(self.parent_win.inp_source.text().strip())
+                    src = normalize_user_path(self.parent_win.inp_source.text())
                     if os.path.isdir(src):
                         start_dir = src
                     elif os.path.isfile(src):
@@ -782,16 +1281,7 @@ class SmartLineEdit(QLineEdit):
                     self, "Select File to Run After Extraction", start_dir
                 )
                 if file_path:
-                    norm_file = os.path.normpath(file_path)
-                    norm_start = os.path.normpath(start_dir) if start_dir else ""
-                    if norm_start and (
-                        norm_file.lower() == norm_start.lower()
-                        or norm_file.lower().startswith(norm_start.lower() + os.sep)
-                    ):
-                        rel_path = os.path.relpath(norm_file, norm_start)
-                        self.setText(rel_path)
-                    else:
-                        self.setText(norm_file)
+                    self.setText(self._format_run_file_selection(file_path))
             elif action == act_manual:
                 self.setFocus()
 
@@ -807,9 +1297,17 @@ class SmartLineEdit(QLineEdit):
             if urls:
                 local_path = urls[0].toLocalFile()
                 if local_path:
-                    dropped_path = os.path.normpath(local_path)
+                    dropped_path = normalize_user_path(local_path)
+                    if (self.parent_win is not None
+                            and os.path.isfile(dropped_path)
+                            and dropped_path.lower().endswith(".json")):
+                        self.parent_win.import_config_from_path(dropped_path)
+                        event.acceptProposedAction()
+                        return
                     if self.mode == "source" and self.parent_win is not None:
                         self.parent_win.on_source_dropped(dropped_path)
+                    elif self.mode == "run_file":
+                        self.setText(self._format_run_file_selection(dropped_path))
                     else:
                         self.setText(dropped_path)
             event.acceptProposedAction()
@@ -828,13 +1326,13 @@ class SFXDropLogo(QLabel):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path and os.path.isfile(path) and os.path.splitext(path)[1].lower() in ('.exe', '.sfx'):
-                return os.path.normpath(path)
+                return normalize_user_path(path)
         return ''
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setToolTip('Click to inspect an EXE/SFX or drop it here to open its config in Notepad.')
+        self.setToolTip('Click to inspect an EXE/SFX or drop it here to open its config in your default editor.')
 
     def dragEnterEvent(self, event):
         if self._first_eligible_file(event):
@@ -858,11 +1356,7 @@ class SFXDropLogo(QLabel):
 
 
 def _looks_like_self_elevating_script(path: str) -> bool:
-    """Recognize common script self-elevation patterns without executing the script.
-
-    Used to request normal Windows UAC consent before Hidden Run.
-    The detection is intentionally conservative.
-    """
+    """Recognize common script self-elevation patterns without executing the script."""
     try:
         if not path or not os.path.isfile(path):
             return False
@@ -871,28 +1365,20 @@ def _looks_like_self_elevating_script(path: str) -> bool:
             return False
         with open(path, "rb") as f:
             content = f.read(512 * 1024).decode("utf-8-sig", errors="replace")
-        # Exclude ordinary line comments; preserve the actual commands.
         lines = [line for line in content.splitlines()
                  if not re.match(r"^\s*(?:rem\s|::|#)", line, re.IGNORECASE)]
         active = "\n".join(lines)
         if ext == ".ps1":
             return bool(re.search(r"(?i)\bstart-process\b[^\r\n]*\s-verb\s+['\"]?runas\b", active))
-        # WindowsUpdateTools.cmd: `fltmc || ... start ...` invokes a second
-        # console through a temporary .Admin file association without admin.
         if re.search(r"(?im)^.*\b(?:fltmc|net\s+session)\b[^\r\n]*\|\|[^\r\n]*\bstart\b", active):
             return True
-        # Common BAT elevation via PowerShell and ShellExecute RunAs.
         return bool(re.search(r"(?i)\bstart-process\b[^\r\n]*-verb\s+['\"]?runas\b", active))
     except (OSError, UnicodeError):
         return False
 
 
 def _remove_build_directory_safely(path: str) -> bool:
-    """Retry transient Windows sharing violations without atexit cleanup errors.
-
-    Windows AV/indexers may briefly hold payload.dat after csc.exe exits.
-    Failure to delete a temporary directory must never invalidate a built EXE.
-    """
+    """Retry transient Windows sharing violations without atexit cleanup errors."""
     for attempt in range(9):
         try:
             shutil.rmtree(path)
@@ -912,11 +1398,78 @@ def _remove_build_directory_safely(path: str) -> bool:
 # ==========================================
 class SFXBuilderWorker(QThread):
     progress = pyqtSignal(int)
-    finished = pyqtSignal(bool, str)
+    build_finished = pyqtSignal(bool, str)
+
+    SEVENZIP_TIMEOUT_SEC = 1800  # 30 minutes max for compression
+    CSC_TIMEOUT_SEC = 120        # 2 minutes max for C# stub compilation
+    MAX_LOG_CHARS = 8192         # Bounded buffer size for 7-Zip output
+    DICT_SCAN_CAP_BYTES = 65 * 1024 * 1024  # >64 MB always selects -md=128m
+    _KNOWN_BUILT_OUTPUTS: set[str] = set()
+    _OUTPUT_LOCK = threading.Lock()
 
     def __init__(self, config: dict):
         super().__init__()
         self.cfg = config
+        self._cancelled = False
+        self._proc_lock = threading.Lock()
+        self._active_proc: subprocess.Popen | None = None
+        self._reserved_target_path: str = ""
+        self._reserved_lock_file: str = ""
+        self.output_exe_path: str = ""
+
+    @staticmethod
+    def _terminate_process_tree(proc: subprocess.Popen | None):
+        """Terminate a child process and all of its descendants, then wait for exit."""
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                pid = proc.pid
+                if os.name == "nt" and pid:
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                            timeout=5,
+                        )
+                    except Exception:
+                        pass
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _release_reservation_lock(self):
+        """Remove the companion .bw_res lock file for this worker."""
+        lock_file = self._reserved_lock_file
+        self._reserved_lock_file = ""
+        self._reserved_target_path = ""
+        if lock_file and os.path.isfile(lock_file):
+            try:
+                os.unlink(lock_file)
+            except OSError:
+                pass
+
+    def cancel(self):
+        """Request cancellation and terminate any active external process tree without blocking the GUI."""
+        self._cancelled = True
+        with self._proc_lock:
+            proc = self._active_proc
+        if proc is not None:
+            threading.Thread(
+                target=self._terminate_process_tree,
+                args=(proc,),
+                daemon=True,
+            ).start()
 
     def find_7zip(self) -> str:
         candidates = [
@@ -942,56 +1495,301 @@ class SFXBuilderWorker(QThread):
                 return c
         return ""
 
-    def resolve_output_exe_path(self) -> str:
-        raw_out_dir = self.cfg["output"].strip().replace("/", "\\")
-        out_dir = os.path.expandvars(raw_out_dir)
-        os.makedirs(out_dir, exist_ok=True)
+    def _get_source_total_size(self, source_path: str) -> int:
+        """Scan source size with cancellation checks and early stop once >64 MB."""
+        if self._cancelled:
+            raise RuntimeError("Canceled by user.")
+        if os.path.isfile(source_path):
+            try:
+                return os.path.getsize(source_path)
+            except OSError:
+                return 0
+        total = 0
+        for root, _, files in os.walk(source_path):
+            if self._cancelled:
+                raise RuntimeError("Canceled by user.")
+            for name in files:
+                if self._cancelled:
+                    raise RuntimeError("Canceled by user.")
+                if (name.startswith(".bw_staging_") and name.endswith(".tmp")) or name.endswith(".bw_res"):
+                    continue
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                    if total >= self.DICT_SCAN_CAP_BYTES:
+                        return total
+                except OSError:
+                    pass
+        return total
 
-        name = self.cfg["name"].strip() or "Package"
+    @staticmethod
+    def _select_7z_dict_flag(total_bytes: int) -> str:
+        """Choose an LZMA2 dictionary size proportional to the input size to save RAM."""
+        mb = total_bytes / (1024 * 1024)
+        if mb <= 8:
+            return "-md=8m"
+        if mb <= 16:
+            return "-md=16m"
+        if mb <= 32:
+            return "-md=32m"
+        if mb <= 64:
+            return "-md=64m"
+        return "-md=128m"
+
+    @staticmethod
+    def sanitize_package_base_name(raw_name: str) -> str:
+        name = (raw_name or "").strip() or "Package"
         if name.lower().endswith(".exe"):
             name = name[:-4]
+        name = re.sub(r'[<>:"/\\|?*]', '_', name).strip().rstrip(". ") or "Package"
+        if is_windows_reserved_name(name):
+            name = f"_{name}"
+        return name
 
-        target_path = os.path.join(out_dir, f"{name}.exe")
+    @classmethod
+    def _try_acquire_reservation_lock(cls, target_candidate: str) -> str:
+        """Atomically acquire a companion '<target_candidate>.bw_res' lock file if target does not exist.
 
-        if self.cfg["dont_replace"] and os.path.exists(target_path):
-            now_dt = datetime.now()
-            fs_stamp = now_dt.strftime("%d.%m.%Y %H.%M.%S")
-            target_path = os.path.join(out_dir, f"{name}_{fs_stamp}.exe")
+        Using a '.bw_res' companion file instead of a 0-byte '.exe' ensures that:
+        1. Two concurrent workers/processes never pick the same target_exe name.
+        2. No 0-byte '.exe' file ever exists in the source directory to be archived by 7-Zip.
+        """
+        if os.path.exists(target_candidate):
+            return ""
 
-        return target_path
+        lock_path = f"{target_candidate}.bw_res"
+        for _ in range(2):
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+                try:
+                    os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+                finally:
+                    os.close(fd)
+                # Verify target_candidate was not created right before lock acquisition
+                if os.path.exists(target_candidate):
+                    try:
+                        os.unlink(lock_path)
+                    except OSError:
+                        pass
+                    return ""
+                return lock_path
+            except OSError as exc:
+                if exc.errno != errno.EEXIST and not os.path.exists(lock_path):
+                    raise
+                # Check if the existing .bw_res lock belongs to a dead process
+                try:
+                    age = time.time() - os.path.getmtime(lock_path)
+                    if age > 30:
+                        with open(lock_path, "r", encoding="ascii", errors="ignore") as f:
+                            pid_str = f.read().strip()
+                        owner_pid = int(pid_str) if pid_str.isdigit() else 0
+                        if owner_pid > 0 and owner_pid != os.getpid() and not _is_pid_running(owner_pid):
+                            os.unlink(lock_path)
+                            continue
+                except OSError:
+                    pass
+                return ""
+        return ""
+
+    @staticmethod
+    def _try_move_no_overwrite(src_path: str, dst_path: str) -> bool:
+        """Atomically move src_path to dst_path while strictly refusing to overwrite an existing file."""
+        if os.name == "nt" and _win32_k32 is not None:
+            ctypes.set_last_error(0)
+            # dwFlags = 0 -> Do NOT set MOVEFILE_REPLACE_EXISTING
+            if _win32_k32.MoveFileExW(src_path, dst_path, 0):
+                return True
+            return False
+        try:
+            os.link(src_path, dst_path)
+            os.unlink(src_path)
+            return True
+        except OSError:
+            return False
+
+    def _iter_dont_replace_candidates(self, out_dir: str, name: str):
+        """Yield candidate output paths in deterministic order for Don't Replace."""
+        yield os.path.join(out_dir, f"{name}.exe")
+        fs_stamp = datetime.now().strftime("%d.%m.%Y %H.%M.%S")
+        yield os.path.join(out_dir, f"{name}_{fs_stamp}.exe")
+        counter = 2
+        while True:
+            yield os.path.join(out_dir, f"{name}_{fs_stamp} ({counter}).exe")
+            counter += 1
+
+    def resolve_output_exe_path(self) -> str:
+        """Resolve (and atomically reserve via .bw_res when Don't Replace is enabled) the output EXE path."""
+        out_dir = normalize_user_path(self.cfg["output"])
+        os.makedirs(out_dir, exist_ok=True)
+        name = self.sanitize_package_base_name(self.cfg["name"])
+
+        if not self.cfg["dont_replace"]:
+            return os.path.join(out_dir, f"{name}.exe")
+
+        if (self._reserved_target_path
+                and self._reserved_lock_file
+                and os.path.isfile(self._reserved_lock_file)
+                and not os.path.exists(self._reserved_target_path)):
+            return self._reserved_target_path
+
+        with self._OUTPUT_LOCK:
+            for candidate in self._iter_dont_replace_candidates(out_dir, name):
+                lock_file = self._try_acquire_reservation_lock(candidate)
+                if lock_file:
+                    self._reserved_target_path = candidate
+                    self._reserved_lock_file = lock_file
+                    return candidate
+
+    def _commit_staging_exe(self, staging_exe: str, target_exe: str) -> str:
+        """Move staging_exe to its final destination, guaranteeing no overwrite if Don't Replace is enabled."""
+        out_dir = os.path.dirname(target_exe)
+        name = self.sanitize_package_base_name(self.cfg["name"])
+
+        if not self.cfg["dont_replace"]:
+            os.replace(staging_exe, target_exe)
+            with self._OUTPUT_LOCK:
+                self._KNOWN_BUILT_OUTPUTS.add(os.path.normcase(os.path.realpath(os.path.abspath(target_exe))))
+            return target_exe
+
+        with self._OUTPUT_LOCK:
+            try:
+                if not os.path.exists(target_exe) and self._try_move_no_overwrite(staging_exe, target_exe):
+                    self._KNOWN_BUILT_OUTPUTS.add(
+                        os.path.normcase(os.path.realpath(os.path.abspath(target_exe)))
+                    )
+                    return target_exe
+
+                for candidate in self._iter_dont_replace_candidates(out_dir, name):
+                    if os.path.exists(candidate):
+                        continue
+                    # Respect active .bw_res locks held by other concurrent workers
+                    other_lock = f"{candidate}.bw_res"
+                    if os.path.exists(other_lock) and other_lock != self._reserved_lock_file:
+                        continue
+                    if self._try_move_no_overwrite(staging_exe, candidate):
+                        self._KNOWN_BUILT_OUTPUTS.add(
+                            os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+                        )
+                        return candidate
+            finally:
+                self._release_reservation_lock()
 
     def get_internal_7z_password(self) -> str:
-        """
-        Determines the internal 7-Zip encryption password:
-        - If user Password is set, uses that password.
-        - If Crypto is enabled, uses "byte" silently in the background.
-        """
         if self.cfg["use_password"] and self.cfg["password"]:
             return self.cfg["password"]
         if self.cfg["crypto"]:
             return "byte"
         return ""
 
-    def build_7z_archive(self, seven_zip: str, source_path: str, archive_path: str) -> subprocess.CompletedProcess:
-        cmd = [seven_zip, "a"]
+    def _compute_7z_exclusions(self, source_path: str, target_exe: str, run_script_path: str = "") -> list[str]:
+        """Exclude staging files, .bw_res locks, target_exe, and verified Byte Wrapper SFX outputs."""
+        exclusions = [
+            "-x!*.bw_staging_*.tmp",
+            "-x!.bw_staging_*.tmp",
+            "-x!*.bw_res",
+            "-x!.bw_res*",
+        ]
+        if not os.path.isdir(source_path):
+            return exclusions
+
+        src_real = os.path.realpath(os.path.abspath(source_path))
+        src_real_nc = os.path.normcase(src_real)
+        out_dir_real = os.path.realpath(os.path.abspath(os.path.dirname(target_exe)))
+        out_dir_real_nc = os.path.normcase(out_dir_real)
+        try:
+            common = os.path.commonpath((src_real_nc, out_dir_real_nc))
+        except ValueError:
+            return exclusions
+
+        if common != src_real_nc:
+            return exclusions
+
+        run_real_nc = (
+            os.path.normcase(os.path.realpath(os.path.abspath(run_script_path)))
+            if run_script_path and os.path.exists(run_script_path)
+            else ""
+        )
+
+        files_to_exclude: set[str] = set()
+        target_real = os.path.realpath(os.path.abspath(target_exe))
+        if os.path.normcase(target_real) != run_real_nc:
+            files_to_exclude.add(target_real)
+
+        # Scan existing .exe files in out_dir and exclude verified Byte Wrapper SFX packages
+        # or files that currently have an active .bw_res companion reservation lock.
+        if os.path.isdir(out_dir_real):
+            try:
+                for entry in os.scandir(out_dir_real):
+                    if not entry.is_file() or not entry.name.lower().endswith(".exe"):
+                        continue
+                    cand_real = os.path.realpath(entry.path)
+                    cand_real_nc = os.path.normcase(cand_real)
+                    if cand_real_nc == run_real_nc:
+                        continue
+                    with self._OUTPUT_LOCK:
+                        is_known = cand_real_nc in self._KNOWN_BUILT_OUTPUTS
+                    has_res_lock = os.path.exists(f"{entry.path}.bw_res")
+                    if is_known or has_res_lock or _is_byte_wrapper_sfx_file(cand_real):
+                        files_to_exclude.add(cand_real)
+            except OSError:
+                pass
+
+        for exc_abs in sorted(files_to_exclude):
+            try:
+                rel_exc = os.path.relpath(exc_abs, src_real).replace("/", "\\")
+                if rel_exc and not rel_exc.startswith(".."):
+                    exclusions.append(f"-x!{rel_exc}")
+            except ValueError:
+                pass
+
+        return exclusions
+
+    @staticmethod
+    def _normalize_run_command_for_stub(source_path: str, raw_run_cmd: str) -> str:
+        """Convert run file paths inside Source into portable relative paths for the C# stub."""
+        cmd_part, args_part = _split_command_and_args(raw_run_cmd, source_path)
+        if not cmd_part:
+            return ""
+        rel_cmd = _strip_relative_leading_slashes(cmd_part)
+
+        if os.path.isfile(source_path):
+            rel_cmd = os.path.basename(source_path)
+        elif os.path.isdir(source_path):
+            resolved = _resolve_unique_run_file_in_source(source_path, raw_run_cmd)
+            if resolved:
+                try:
+                    rel_cmd = os.path.relpath(
+                        os.path.realpath(os.path.abspath(resolved)),
+                        os.path.realpath(os.path.abspath(source_path)),
+                    )
+                except ValueError:
+                    pass
+
+        if " " in rel_cmd and not rel_cmd.startswith('"'):
+            rel_cmd = f'"{rel_cmd}"'
+        return f"{rel_cmd} {args_part}".strip() if args_part else rel_cmd
+
+    def build_7z_archive(self, seven_zip: str, source_path: str, archive_path: str, target_exe: str, run_script_path: str = "") -> subprocess.CompletedProcess:
+        cmd = [seven_zip, "a", "-bsp1"]
 
         if self.cfg["compress"]:
+            dict_flag = self._select_7z_dict_flag(self._get_source_total_size(source_path))
             cmd.extend([
                 "-t7z",
                 "-mx=9",
                 "-m0=lzma2",
-                "-md=256m",
+                dict_flag,
                 "-mfb=64",
                 "-ms=16g",
                 "-mmt=on"
             ])
         else:
-            cmd.extend(["-t7z", "-mx=1", "-mmt=on"])
+            cmd.extend(["-t7z", "-mx=0", "-mmt=on"])
 
         internal_pw = self.get_internal_7z_password()
         if internal_pw:
             cmd.extend([f"-p{internal_pw}", "-mhe=on"])
 
+        cmd.extend(self._compute_7z_exclusions(source_path, target_exe, run_script_path))
         cmd.extend(["-y", archive_path])
 
         if os.path.isdir(source_path):
@@ -1000,44 +1798,133 @@ class SFXBuilderWorker(QThread):
             cmd.append(source_path)
 
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        return subprocess.run(cmd, capture_output=True, text=True, creationflags=creation_flags)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creation_flags
+        )
+        with self._proc_lock:
+            self._active_proc = proc
+
+        if self._cancelled:
+            self._terminate_process_tree(proc)
+            with self._proc_lock:
+                self._active_proc = None
+            raise RuntimeError("Canceled by user.")
+
+        timed_out = False
+
+        def _on_timeout():
+            nonlocal timed_out
+            timed_out = True
+            self._terminate_process_tree(proc)
+
+        timer = threading.Timer(self.SEVENZIP_TIMEOUT_SEC, _on_timeout)
+        timer.daemon = True
+        timer.start()
+
+        tail_chars: deque[str] = deque(maxlen=self.MAX_LOG_CHARS)
+        pct_pattern = re.compile(r"(\d{1,3})%")
+        try:
+            if proc.stdout is not None:
+                buf = ""
+                while True:
+                    if self._cancelled:
+                        self._terminate_process_tree(proc)
+                        raise RuntimeError("Canceled by user.")
+                    ch = proc.stdout.read(1)
+                    if not ch:
+                        break
+                    tail_chars.append(ch)
+                    if ch in ("\r", "\n", "\b"):
+                        m = pct_pattern.search(buf)
+                        if m:
+                            pct = min(100, max(0, int(m.group(1))))
+                            mapped = 20 + int((pct / 100.0) * 40)
+                            self.progress.emit(mapped)
+                        buf = ""
+                    else:
+                        buf += ch
+                        if len(buf) > 128:
+                            buf = buf[-64:]
+
+            ret = proc.wait()
+            if self._cancelled:
+                self._terminate_process_tree(proc)
+                raise RuntimeError("Canceled by user.")
+            if timed_out:
+                self._terminate_process_tree(proc)
+                raise TimeoutError("7-Zip compression timed out.")
+            combined_output = "".join(tail_chars)
+            return subprocess.CompletedProcess(cmd, ret, combined_output, "")
+        finally:
+            timer.cancel()
+            with self._proc_lock:
+                self._active_proc = None
 
     def prepare_payload(self, raw_7z_path: str, out_dat_path: str) -> tuple[str, bool]:
-        """
-        When Crypto is enabled, scrambles the binary payload in chunks
-        so the encrypted package is not directly readable by 7-Zip.
-        When Crypto is disabled, reuses raw_7z_path directly so 7-Zip can open it.
-        """
         if not self.cfg["crypto"]:
             return raw_7z_path, False
 
-        key_bytes = b"byte_wrapper_secret_key_2026"
+        key_bytes = b"byte_wrapper_secret_key"
         key_len = len(key_bytes)
-        chunk_size = 1024 * 1024  # 1 MB chunks
-        offset = 0
+        period = key_len * 256
+        base_mask = bytes(
+            key_bytes[i % key_len] ^ ((i & 0xFF) ^ 0xA5)
+            for i in range(period)
+        )
+
+        chunk_size = period * 178  # 1,048,064 bytes (~1 MB)
+        full_mask = base_mask * 178
+        full_mask_int = int.from_bytes(full_mask, "little")
+
+        total_size = max(1, os.path.getsize(raw_7z_path))
+        processed = 0
+        last_emitted = 60
 
         with open(raw_7z_path, "rb") as fin, open(out_dat_path, "wb") as fout:
             while True:
-                buf = bytearray(fin.read(chunk_size))
-                if not buf:
+                if self._cancelled:
+                    raise RuntimeError("Canceled by user.")
+                chunk = fin.read(chunk_size)
+                if not chunk:
                     break
-                for i in range(len(buf)):
-                    global_idx = offset + i
-                    buf[i] ^= key_bytes[global_idx % key_len] ^ ((global_idx & 0xFF) ^ 0xA5)
-                fout.write(buf)
-                offset += len(buf)
+                n = len(chunk)
+                if n == chunk_size:
+                    xored = int.from_bytes(chunk, "little") ^ full_mask_int
+                else:
+                    sub_mask_int = int.from_bytes(full_mask[:n], "little")
+                    xored = int.from_bytes(chunk, "little") ^ sub_mask_int
+                fout.write(xored.to_bytes(n, "little"))
+                processed += n
+                mapped = 60 + int((processed / total_size) * 15)
+                if mapped != last_emitted:
+                    last_emitted = mapped
+                    self.progress.emit(mapped)
+
+        if self._cancelled:
+            raise RuntimeError("Canceled by user.")
 
         return out_dat_path, True
 
-    def compile_csharp_sfx(self, csc_path: str, work_dir: str, payload_dat: str, scrambled: bool, seven_zip: str, target_exe: str) -> tuple[bool, str]:
+    def compile_csharp_sfx(self, csc_path: str, work_dir: str, payload_dat: str, scrambled: bool, seven_zip: str, staging_exe: str) -> tuple[bool, str]:
+        """Compile the C# stub and append the payload into staging_exe (never touching an existing target_exe)."""
+        if self._cancelled:
+            return False, "Canceled by user."
+
         shutil.copy2(seven_zip, os.path.join(work_dir, "7z.exe"))
         seven_zip_dll = os.path.join(os.path.dirname(seven_zip), "7z.dll")
         has_dll = os.path.isfile(seven_zip_dll)
         if has_dll:
             shutil.copy2(seven_zip_dll, os.path.join(work_dir, "7z.dll"))
 
-        src_norm = os.path.normpath(os.path.expandvars(self.cfg["source"].strip()))
+        src_norm = normalize_user_path(self.cfg["source"])
         source_folder_name = os.path.basename(src_norm) if os.path.isdir(src_norm) else ""
+        portable_run_cmd = self._normalize_run_command_for_stub(src_norm, self.cfg["run_file"])
 
         def cs_escape(s: str) -> str:
             return (
@@ -1052,22 +1939,26 @@ class SFXBuilderWorker(QThread):
         raw_desc = self.cfg["description"].strip()
         file_desc_str = cs_escape(raw_desc if raw_desc else (self.cfg["name"].strip() or "Byte Wrapper Package"))
 
+        pe_ver_num, pe_ver_info = _normalize_pe_version(self.cfg.get("version", ""))
+        pe_ver_num_str = cs_escape(pe_ver_num)
+        pe_ver_info_str = cs_escape(pe_ver_info)
+
         extract_to_str = cs_escape(self.cfg["extract_to"].strip())
-        run_file_str = cs_escape(self.cfg["run_file"].strip())
+        run_file_str = cs_escape(portable_run_cmd)
         source_folder_name_str = cs_escape(source_folder_name)
 
-        internal_7z_pw = cs_escape(self.get_internal_7z_password())
-        ask_user_pw = "true" if (self.cfg["use_password"] and bool(self.cfg["password"])) else "false"
-        expected_user_pw = cs_escape(self.cfg["password"])
+        has_user_pw = bool(self.cfg["use_password"] and self.cfg["password"])
+        ask_user_pw = "true" if has_user_pw else "false"
+        if has_user_pw:
+            expected_user_pw_hash = hashlib.sha256(self.cfg["password"].encode("utf-8")).hexdigest().lower()
+            internal_7z_pw = ""
+        else:
+            expected_user_pw_hash = ""
+            internal_7z_pw = cs_escape(self.get_internal_7z_password())
 
         is_scrambled = "true" if scrambled else "false"
-        # A transparent package stores its 7z archive ONLY as the final EXE
-        # overlay. Previously it was also embedded in the .NET resources,
-        # pushing the outer 7z signature past archive scanners' search limit.
-        overlay_archive_size = 0 if scrambled else os.path.getsize(payload_dat)
+        overlay_archive_size = os.path.getsize(payload_dat)
         hidden_run = "true" if self.cfg["hidden_run"] else "false"
-        # Only scripts that deliberately relaunch themselves for elevation
-        # need the wrapper to obtain normal UAC approval first.
         hidden_script_needs_admin = "true" if (
             self.cfg["hidden_run"]
             and not self.cfg["run_as_admin"]
@@ -1079,14 +1970,16 @@ class SFXBuilderWorker(QThread):
         show_progress = "true" if self.cfg["progress_bar"] else "false"
 
         exec_level = "requireAdministrator" if self.cfg["run_as_admin"] else "asInvoker"
+        safe_xml_ver = xml_escape(pe_ver_num, {'"': '&quot;', "'": '&apos;'})
+        safe_xml_level = xml_escape(exec_level, {'"': '&quot;', "'": '&apos;'})
         manifest_path = os.path.join(work_dir, "app.manifest")
         manifest_xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="1.0.0.0" name="ByteWrapper.Package"/>
+  <assemblyIdentity version="{safe_xml_ver}" name="ByteWrapper.Package"/>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <requestedExecutionLevel level="{exec_level}" uiAccess="false" />
+        <requestedExecutionLevel level="{safe_xml_level}" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>
@@ -1095,24 +1988,29 @@ class SFXBuilderWorker(QThread):
         with open(manifest_path, "w", encoding="utf-8") as f:
             f.write(manifest_xml)
 
-        cs_code = rf"""
+        def build_cs_source(pw_literal: str, hash_literal: str) -> str:
+            return rf"""
 using System;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Drawing;
 using System.Reflection;
 using System.Diagnostics;
 using System.ComponentModel;
+using System.Threading;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("{file_desc_str}")]
 [assembly: AssemblyDescription("{file_desc_str}")]
 [assembly: AssemblyProduct("{prod_name_str}")]
 [assembly: AssemblyCompany("Byte Wrapper")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("{pe_ver_num_str}")]
+[assembly: AssemblyFileVersion("{pe_ver_num_str}")]
+[assembly: AssemblyInformationalVersion("{pe_ver_info_str}")]
 
 namespace ByteWrapperStub
 {{
@@ -1121,9 +2019,9 @@ namespace ByteWrapperStub
         private static readonly string EXTRACT_TO = "{extract_to_str}";
         private static readonly string RUN_FILE = "{run_file_str}";
         private static readonly string SOURCE_FOLDER_NAME = "{source_folder_name_str}";
-        private static readonly string INTERNAL_7Z_PW = "{internal_7z_pw}";
+        private static readonly string INTERNAL_7Z_PW = "{pw_literal}";
         private static readonly bool ASK_USER_PW = {ask_user_pw};
-        private static readonly string EXPECTED_USER_PW = "{expected_user_pw}";
+        private static readonly string EXPECTED_USER_PW_HASH = "{hash_literal}";
         private static readonly bool IS_SCRAMBLED = {is_scrambled};
         private static readonly long OVERLAY_ARCHIVE_SIZE = {overlay_archive_size}L;
         private static readonly bool HIDDEN_RUN = {hidden_run};
@@ -1132,6 +2030,7 @@ namespace ByteWrapperStub
         private static readonly bool INSTANCES = {instances};
         private static readonly bool SELF_REMOVE = {self_remove};
         private static readonly bool SHOW_PROGRESS = {show_progress};
+        private const string TEMP_MARKER_FILE = ".bw_temp_marker";
 
         private const int STARTF_USESHOWWINDOW = 0x00000001;
         private const short SW_HIDE = 0;
@@ -1186,42 +2085,231 @@ namespace ByteWrapperStub
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
 
+        private static string ComputeSha256Hex(string text)
+        {{
+            using (SHA256 sha = SHA256.Create())
+            {{
+                byte[] bytes = Encoding.UTF8.GetBytes(text ?? "");
+                byte[] hash = sha.ComputeHash(bytes);
+                StringBuilder sb = new StringBuilder(hash.Length * 2);
+                for (int i = 0; i < hash.Length; i++)
+                    sb.Append(hash[i].ToString("x2"));
+                return sb.ToString();
+            }}
+        }}
+
+        private static string StripLeadingRelativeSlashes(string path)
+        {{
+            if (string.IsNullOrEmpty(path))
+                return "";
+            if (path.StartsWith(@"\\"))
+                return path;
+            return path.TrimStart('\\', '/');
+        }}
+
+        private static string Format7zPasswordSwitch(string pw)
+        {{
+            if (string.IsNullOrEmpty(pw))
+                return "";
+            StringBuilder sb = new StringBuilder();
+            int backslashes = 0;
+            foreach (char c in pw)
+            {{
+                if (c == '\\')
+                {{
+                    backslashes++;
+                }}
+                else if (c == '"')
+                {{
+                    sb.Append('\\', backslashes * 2 + 1);
+                    sb.Append('"');
+                    backslashes = 0;
+                }}
+                else
+                {{
+                    if (backslashes > 0)
+                    {{
+                        sb.Append('\\', backslashes);
+                        backslashes = 0;
+                    }}
+                    sb.Append(c);
+                }}
+            }}
+            if (backslashes > 0)
+                sb.Append('\\', backslashes * 2);
+            return "-p\"" + sb.ToString() + "\" ";
+        }}
+
+        private static void WriteTempMarker(string dirPath)
+        {{
+            try
+            {{
+                string markerPath = Path.Combine(dirPath, TEMP_MARKER_FILE);
+                File.WriteAllText(markerPath, "ByteWrapperTemp");
+                File.SetAttributes(markerPath, FileAttributes.Hidden);
+            }}
+            catch {{ }}
+        }}
+
+        private static bool HasTempMarker(string dirPath)
+        {{
+            try
+            {{
+                return File.Exists(Path.Combine(dirPath, TEMP_MARKER_FILE));
+            }}
+            catch
+            {{
+                return false;
+            }}
+        }}
+
+        private static bool TryDeleteDirectoryIfUnused(string dirPath, bool requireMarker)
+        {{
+            if (string.IsNullOrEmpty(dirPath) || !Directory.Exists(dirPath))
+                return true;
+
+            if (requireMarker && !HasTempMarker(dirPath))
+                return false;
+
+            string trimmed = dirPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string parentDir = Path.GetDirectoryName(trimmed);
+            if (string.IsNullOrEmpty(parentDir))
+                return false;
+
+            string probePath = Path.Combine(parentDir, ".bw_del_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            try
+            {{
+                // Atomic rename on the same NTFS volume fails without deleting or locking any file
+                // if any file/handle or working directory inside trimmed is open.
+                Directory.Move(trimmed, probePath);
+            }}
+            catch
+            {{
+                return false;
+            }}
+
+            try
+            {{
+                Directory.Delete(probePath, true);
+                return true;
+            }}
+            catch
+            {{
+                try
+                {{
+                    if (Directory.Exists(probePath) && !Directory.Exists(trimmed))
+                        Directory.Move(probePath, trimmed);
+                }}
+                catch {{ }}
+                return false;
+            }}
+        }}
+
+        private static void StartBackgroundStaleCleanup()
+        {{
+            ThreadPool.QueueUserWorkItem(delegate
+            {{
+                try
+                {{
+                    string tempRoot = Path.GetTempPath();
+                    DateTime threshold = DateTime.UtcNow.AddHours(-6);
+                    foreach (string pattern in new string[] {{ "BytePkg_*", "bw_rt_*" }})
+                    {{
+                        string[] dirs;
+                        try {{ dirs = Directory.GetDirectories(tempRoot, pattern); }}
+                        catch {{ continue; }}
+                        foreach (string dir in dirs)
+                        {{
+                            try
+                            {{
+                                if (Directory.GetLastWriteTimeUtc(dir) < threshold)
+                                    TryDeleteDirectoryIfUnused(dir, true);
+                            }}
+                            catch {{ }}
+                        }}
+                    }}
+                }}
+                catch {{ }}
+            }});
+        }}
+
+        private static bool IsTempRootPath(string rawExtractTo)
+        {{
+            if (string.IsNullOrWhiteSpace(rawExtractTo))
+                return true;
+            string trimmed = rawExtractTo.Trim().Trim('"');
+            if (string.Equals(trimmed, "%Temp%", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(trimmed, "%TMP%", StringComparison.OrdinalIgnoreCase))
+                return true;
+            try
+            {{
+                string expanded = Path.GetFullPath(Environment.ExpandEnvironmentVariables(trimmed.Replace("/", "\\")))
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string sysTemp = Path.GetFullPath(Path.GetTempPath())
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                return string.Equals(expanded, sysTemp, StringComparison.OrdinalIgnoreCase);
+            }}
+            catch
+            {{
+                return false;
+            }}
+        }}
+
         [STAThread]
         static void Main()
         {{
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // An unelevated self-elevating CMD would create a second, visible
-            // console outside the hidden launcher. Ask Windows for UAC consent
-            // BEFORE the CMD runs. Existing administrative launches are unchanged.
+            StartBackgroundStaleCleanup();
+
             if (HIDDEN_RUN && HIDDEN_SCRIPT_NEEDS_ADMIN && !IsRunningAsAdministrator())
             {{
                 RelaunchPackageElevatedHidden();
                 return;
             }}
 
+            string runtime7zPw = INTERNAL_7Z_PW;
             if (ASK_USER_PW)
             {{
                 string inputPw = PromptPassword();
                 if (inputPw == null)
                     return;
-                if (inputPw != EXPECTED_USER_PW)
+                if (!string.Equals(ComputeSha256Hex(inputPw), EXPECTED_USER_PW_HASH, StringComparison.OrdinalIgnoreCase))
                 {{
                     MessageBox.Show("Invalid password!", "{prod_name_str}", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }}
+                runtime7zPw = inputPw;
             }}
 
-            string targetDir = string.IsNullOrWhiteSpace(EXTRACT_TO)
-                ? Path.Combine(Path.GetTempPath(), "BytePkg_" + Guid.NewGuid().ToString("N").Substring(0, 8))
-                : Environment.ExpandEnvironmentVariables(EXTRACT_TO.Replace("/", "\\"));
-
-            if (!string.IsNullOrEmpty(SOURCE_FOLDER_NAME) && !string.IsNullOrEmpty(RUN_FILE))
+            bool extractToIsTempRoot = IsTempRootPath(EXTRACT_TO);
+            bool isTempExtraction = !EXTRACT_ONLY && extractToIsTempRoot;
+            string targetDir;
+            if (isTempExtraction)
             {{
-                string expandedRun = Environment.ExpandEnvironmentVariables(RUN_FILE.Replace("/", "\\"));
+                targetDir = Path.Combine(Path.GetTempPath(), "BytePkg_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            }}
+            else if (EXTRACT_ONLY && extractToIsTempRoot)
+            {{
+                // Persistent isolated folder for Extract Only when Extract To was left empty or set to %Temp%
+                string uniqueSuffix = Guid.NewGuid().ToString("N").Substring(0, 8);
+                string subFolder = !string.IsNullOrEmpty(SOURCE_FOLDER_NAME)
+                    ? (SOURCE_FOLDER_NAME + "_" + uniqueSuffix)
+                    : ("ByteExtract_" + uniqueSuffix);
+                targetDir = Path.Combine(Path.GetTempPath(), subFolder);
+            }}
+            else
+            {{
+                targetDir = Environment.ExpandEnvironmentVariables(EXTRACT_TO.Replace("/", "\\").Trim().Trim('"'));
+            }}
+
+            if (!isTempExtraction && !string.IsNullOrEmpty(SOURCE_FOLDER_NAME) && !string.IsNullOrEmpty(RUN_FILE))
+            {{
+                string expandedRun = Environment.ExpandEnvironmentVariables(RUN_FILE.Replace("/", "\\")).Trim().Trim('"');
                 string expectedSub = Path.Combine(targetDir, SOURCE_FOLDER_NAME);
-                if (expandedRun.StartsWith(expectedSub + "\\", StringComparison.OrdinalIgnoreCase) &&
+                if ((expandedRun.StartsWith(expectedSub + "\\", StringComparison.OrdinalIgnoreCase) ||
+                     expandedRun.StartsWith(SOURCE_FOLDER_NAME + "\\", StringComparison.OrdinalIgnoreCase)) &&
                     !targetDir.EndsWith(SOURCE_FOLDER_NAME, StringComparison.OrdinalIgnoreCase))
                 {{
                     targetDir = expectedSub;
@@ -1231,6 +2319,8 @@ namespace ByteWrapperStub
             try
             {{
                 Directory.CreateDirectory(targetDir);
+                if (isTempExtraction)
+                    WriteTempMarker(targetDir);
             }}
             catch (Exception ex)
             {{
@@ -1241,69 +2331,152 @@ namespace ByteWrapperStub
 
             string workTemp = Path.Combine(Path.GetTempPath(), "bw_rt_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(workTemp);
+            WriteTempMarker(workTemp);
 
-            Form progressForm = null;
-            if (SHOW_PROGRESS && !HIDDEN_RUN)
-            {{
-                progressForm = CreateProgressForm();
-                progressForm.Show();
-                Application.DoEvents();
-            }}
+            Exception extractError = null;
+            int launchedPid = 0;
 
             try
             {{
-                string sevenZExe = Path.Combine(workTemp, "7z.exe");
-                string sevenZDll = Path.Combine(workTemp, "7z.dll");
-                string archive7z = Path.Combine(workTemp, "pkg.7z");
-
-                ExtractResource("7z.exe", sevenZExe, false);
-                ExtractResourceIfExists("7z.dll", sevenZDll, false);
-                if (IS_SCRAMBLED)
-                    ExtractResource("payload.dat", archive7z, true);
-                else
-                    ExtractOverlayArchive(archive7z);
-
-                Application.DoEvents();
-
-                StringBuilder args = new StringBuilder();
-                args.Append("x \"" + archive7z + "\" ");
-                args.Append("-o\"" + targetDir + "\" ");
-                if (!string.IsNullOrEmpty(INTERNAL_7Z_PW))
+                Action<Action<int>> extractAction = delegate(Action<int> reportProgress)
                 {{
-                    string safePw = INTERNAL_7Z_PW.Replace("\"", "\\\"");
-                    args.Append("-p\"" + safePw + "\" ");
-                }}
-                args.Append(INSTANCES ? "-aos -y" : "-aoa -y");
-
-                ProcessStartInfo psi7z = new ProcessStartInfo();
-                psi7z.FileName = sevenZExe;
-                psi7z.Arguments = args.ToString();
-                psi7z.UseShellExecute = false;
-                psi7z.CreateNoWindow = true;
-                psi7z.WindowStyle = ProcessWindowStyle.Hidden;
-
-                using (Process p = Process.Start(psi7z))
-                {{
-                    if (p == null)
-                        throw new InvalidOperationException("7-Zip extractor could not start.");
-                    while (!p.WaitForExit(50))
+                    try
                     {{
-                        Application.DoEvents();
+                        string sevenZExe = Path.Combine(workTemp, "7z.exe");
+                        string sevenZDll = Path.Combine(workTemp, "7z.dll");
+                        string archive7z = Path.Combine(workTemp, "pkg.7z");
+
+                        ExtractResource("7z.exe", sevenZExe);
+                        ExtractResourceIfExists("7z.dll", sevenZDll);
+                        ExtractOverlayArchive(archive7z, IS_SCRAMBLED, reportProgress);
+
+                        StringBuilder args = new StringBuilder();
+                        args.Append("x -bsp1 \"" + archive7z + "\" ");
+                        args.Append("-o\"" + targetDir + "\" ");
+                        if (!string.IsNullOrEmpty(runtime7zPw))
+                        {{
+                            args.Append(Format7zPasswordSwitch(runtime7zPw));
+                        }}
+                        args.Append(INSTANCES ? "-aos -y" : "-aoa -y");
+
+                        ProcessStartInfo psi7z = new ProcessStartInfo();
+                        psi7z.FileName = sevenZExe;
+                        psi7z.Arguments = args.ToString();
+                        psi7z.UseShellExecute = false;
+                        psi7z.CreateNoWindow = true;
+                        psi7z.WindowStyle = ProcessWindowStyle.Hidden;
+                        psi7z.RedirectStandardOutput = true;
+                        psi7z.RedirectStandardError = true;
+
+                        using (Process p = new Process())
+                        {{
+                            p.StartInfo = psi7z;
+                            p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e) {{ }};
+                            if (!p.Start())
+                                throw new InvalidOperationException("7-Zip extractor could not start.");
+                            p.BeginErrorReadLine();
+
+                            Regex pctRegex = new Regex(@"(\d{{1,3}})%");
+                            StringBuilder lineBuf = new StringBuilder();
+                            int ch;
+                            while ((ch = p.StandardOutput.Read()) != -1)
+                            {{
+                                char c = (char)ch;
+                                if (c == '\r' || c == '\n' || c == '\b')
+                                {{
+                                    if (lineBuf.Length > 0)
+                                    {{
+                                        Match m = pctRegex.Match(lineBuf.ToString());
+                                        if (m.Success)
+                                        {{
+                                            int pct;
+                                            if (int.TryParse(m.Groups[1].Value, out pct))
+                                            {{
+                                                if (pct < 0) pct = 0;
+                                                if (pct > 100) pct = 100;
+                                                if (reportProgress != null)
+                                                    reportProgress(50 + (pct / 2));
+                                            }}
+                                        }}
+                                        lineBuf.Length = 0;
+                                    }}
+                                }}
+                                else
+                                {{
+                                    lineBuf.Append(c);
+                                    if (lineBuf.Length > 128)
+                                        lineBuf.Remove(0, 64);
+                                }}
+                            }}
+
+                            p.WaitForExit();
+                            if (p.ExitCode != 0)
+                                throw new InvalidDataException("7-Zip extraction failed with exit code " + p.ExitCode);
+                            if (reportProgress != null)
+                                reportProgress(100);
+                        }}
+
+                        try {{ File.Delete(archive7z); }} catch {{ }}
                     }}
-                    if (p.ExitCode != 0)
-                        throw new InvalidDataException("7-Zip extraction failed with exit code " + p.ExitCode);
+                    catch (Exception ex)
+                    {{
+                        extractError = ex;
+                    }}
+                }};
+
+                if (SHOW_PROGRESS && !HIDDEN_RUN)
+                {{
+                    ProgressBar pbControl;
+                    Label lblControl;
+                    using (Form progressForm = CreateProgressForm(out pbControl, out lblControl))
+                    {{
+                        Action<int> uiReporter = delegate(int val)
+                        {{
+                            try
+                            {{
+                                if (progressForm.IsHandleCreated && !progressForm.IsDisposed)
+                                {{
+                                    progressForm.BeginInvoke((MethodInvoker)delegate
+                                    {{
+                                        if (!pbControl.IsDisposed)
+                                        {{
+                                            int clamped = Math.Max(0, Math.Min(100, val));
+                                            pbControl.Value = clamped;
+                                            lblControl.Text = "Extracting package... " + clamped + "%";
+                                        }}
+                                    }});
+                                }}
+                            }}
+                            catch {{ }}
+                        }};
+
+                        Thread worker = new Thread(delegate()
+                        {{
+                            extractAction(uiReporter);
+                            try
+                            {{
+                                if (progressForm.IsHandleCreated && !progressForm.IsDisposed)
+                                    progressForm.BeginInvoke(new MethodInvoker(progressForm.Close));
+                            }}
+                            catch {{ }}
+                        }});
+                        worker.IsBackground = true;
+                        progressForm.Shown += delegate {{ worker.Start(); }};
+                        progressForm.ShowDialog();
+                        worker.Join();
+                    }}
+                }}
+                else
+                {{
+                    extractAction(null);
                 }}
 
-                if (progressForm != null)
-                {{
-                    progressForm.Close();
-                    progressForm.Dispose();
-                    progressForm = null;
-                }}
+                if (extractError != null)
+                    throw extractError;
 
                 if (!EXTRACT_ONLY && !string.IsNullOrWhiteSpace(RUN_FILE))
                 {{
-                    ExecuteRunFile(targetDir);
+                    launchedPid = ExecuteRunFile(targetDir);
                 }}
             }}
             catch (Exception ex)
@@ -1311,16 +2484,20 @@ namespace ByteWrapperStub
                 if (!HIDDEN_RUN)
                     MessageBox.Show("Package processing failed: " + ex.Message,
                         "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                if (isTempExtraction)
+                {{
+                    TryDeleteDirectoryIfUnused(targetDir, true);
+                }}
                 return;
             }}
             finally
             {{
-                if (progressForm != null)
-                {{
-                    progressForm.Close();
-                    progressForm.Dispose();
-                }}
-                try {{ Directory.Delete(workTemp, true); }} catch {{ }}
+                TryDeleteDirectoryIfUnused(workTemp, true);
+            }}
+
+            if (isTempExtraction && !EXTRACT_ONLY)
+            {{
+                WaitAndCleanupTempFolder(targetDir, launchedPid);
             }}
 
             if (SELF_REMOVE)
@@ -1343,41 +2520,92 @@ namespace ByteWrapperStub
             }}
         }}
 
+        private static string BuildForwardedArguments()
+        {{
+            string[] args = Environment.GetCommandLineArgs();
+            if (args == null || args.Length <= 1)
+                return "";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 1; i < args.Length; i++)
+            {{
+                if (i > 1)
+                    sb.Append(" ");
+                string arg = args[i] ?? "";
+                StringBuilder escaped = new StringBuilder();
+                int bs = 0;
+                foreach (char c in arg)
+                {{
+                    if (c == '\\')
+                    {{
+                        bs++;
+                    }}
+                    else if (c == '"')
+                    {{
+                        escaped.Append('\\', bs * 2 + 1);
+                        escaped.Append('"');
+                        bs = 0;
+                    }}
+                    else
+                    {{
+                        if (bs > 0)
+                        {{
+                            escaped.Append('\\', bs);
+                            bs = 0;
+                        }}
+                        escaped.Append(c);
+                    }}
+                }}
+                if (bs > 0)
+                    escaped.Append('\\', bs * 2);
+                sb.Append("\"").Append(escaped.ToString()).Append("\"");
+            }}
+            return sb.ToString();
+        }}
+
         private static void RelaunchPackageElevatedHidden()
         {{
             try
             {{
-                // The user must approve Windows' regular UAC prompt. No bypass.
                 ProcessStartInfo psi = new ProcessStartInfo();
                 psi.FileName = Application.ExecutablePath;
+                psi.Arguments = BuildForwardedArguments();
                 psi.WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath);
                 psi.UseShellExecute = true;
                 psi.Verb = "runas";
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
                 using (Process process = Process.Start(psi))
                 {{
-                    // Dispose the launcher handle; the elevated package continues independently.
                 }}
             }}
             catch (Win32Exception)
             {{
-                // UAC cancellation or launch failure: do not start visibly as a fallback.
             }}
             catch (Exception)
             {{
-                // No log file is created.
             }}
         }}
 
-        private static void ExecuteRunFile(string targetDir)
+        private static int ExecuteRunFile(string targetDir)
         {{
             string rawCmd = Environment.ExpandEnvironmentVariables(RUN_FILE.Trim().Replace("/", "\\"));
             string resolvedFile = "";
             string arguments = "";
 
-            if (File.Exists(Path.Combine(targetDir, rawCmd)))
+            string strippedSourceRel = StripLeadingRelativeSlashes(rawCmd.Trim().Trim('"'));
+            if (!string.IsNullOrEmpty(SOURCE_FOLDER_NAME) &&
+                strippedSourceRel.StartsWith(SOURCE_FOLDER_NAME + "\\", StringComparison.OrdinalIgnoreCase))
             {{
-                resolvedFile = Path.GetFullPath(Path.Combine(targetDir, rawCmd));
+                strippedSourceRel = StripLeadingRelativeSlashes(strippedSourceRel.Substring(SOURCE_FOLDER_NAME.Length + 1));
+            }}
+
+            string rawRelCandidate = StripLeadingRelativeSlashes(rawCmd);
+            if (!Path.IsPathRooted(rawRelCandidate) && File.Exists(Path.Combine(targetDir, rawRelCandidate)))
+            {{
+                resolvedFile = Path.GetFullPath(Path.Combine(targetDir, rawRelCandidate));
+            }}
+            else if (!Path.IsPathRooted(strippedSourceRel) && File.Exists(Path.Combine(targetDir, strippedSourceRel)))
+            {{
+                resolvedFile = Path.GetFullPath(Path.Combine(targetDir, strippedSourceRel));
             }}
             else if (File.Exists(rawCmd))
             {{
@@ -1397,34 +2625,80 @@ namespace ByteWrapperStub
                 }}
                 else
                 {{
-                    int spaceIdx = rawCmd.IndexOf(' ');
-                    if (spaceIdx > 0)
-                    {{
-                        string firstPart = rawCmd.Substring(0, spaceIdx);
-                        if (File.Exists(firstPart) || File.Exists(Path.Combine(targetDir, firstPart)) || firstPart.Contains("."))
-                        {{
-                            candidatePath = firstPart;
-                            arguments = rawCmd.Substring(spaceIdx + 1).Trim();
-                        }}
-                    }}
+                    bool matchedByExt = false;
+                    string firstExtCandidate = "";
+                    string firstExtArgs = "";
                     string[] knownExtensions = new string[] {{ ".bat", ".cmd", ".ps1", ".exe", ".msi", ".reg" }};
                     foreach (string knownExtension in knownExtensions)
                     {{
-                        int extAt = rawCmd.IndexOf(knownExtension, StringComparison.OrdinalIgnoreCase);
-                        if (extAt < 1) continue;
-                        int endAt = extAt + knownExtension.Length;
-                        if (endAt == rawCmd.Length || Char.IsWhiteSpace(rawCmd[endAt]))
+                        int searchPos = 0;
+                        while (searchPos < rawCmd.Length)
                         {{
-                            candidatePath = rawCmd.Substring(0, endAt);
-                            arguments = rawCmd.Substring(endAt).Trim();
-                            break;
+                            int extAt = rawCmd.IndexOf(knownExtension, searchPos, StringComparison.OrdinalIgnoreCase);
+                            if (extAt < 1) break;
+                            int endAt = extAt + knownExtension.Length;
+                            if (endAt == rawCmd.Length || Char.IsWhiteSpace(rawCmd[endAt]))
+                            {{
+                                string cand = rawCmd.Substring(0, endAt);
+                                string candArgs = rawCmd.Substring(endAt).Trim();
+                                if (string.IsNullOrEmpty(firstExtCandidate))
+                                {{
+                                    firstExtCandidate = cand;
+                                    firstExtArgs = candArgs;
+                                }}
+                                string candRelCheck = StripLeadingRelativeSlashes(cand);
+                                if (File.Exists(cand) ||
+                                    (!Path.IsPathRooted(candRelCheck) && File.Exists(Path.Combine(targetDir, candRelCheck))))
+                                {{
+                                    candidatePath = cand;
+                                    arguments = candArgs;
+                                    matchedByExt = true;
+                                }}
+                            }}
+                            searchPos = endAt;
+                        }}
+                    }}
+
+                    if (!matchedByExt && !string.IsNullOrEmpty(firstExtCandidate))
+                    {{
+                        candidatePath = firstExtCandidate;
+                        arguments = firstExtArgs;
+                        matchedByExt = true;
+                    }}
+
+                    if (!matchedByExt)
+                    {{
+                        int spaceIdx = rawCmd.IndexOf(' ');
+                        if (spaceIdx > 0)
+                        {{
+                            string firstPart = rawCmd.Substring(0, spaceIdx);
+                            string firstRel = StripLeadingRelativeSlashes(firstPart);
+                            if (File.Exists(firstPart) ||
+                                (!Path.IsPathRooted(firstRel) && File.Exists(Path.Combine(targetDir, firstRel))) ||
+                                firstPart.Contains("."))
+                            {{
+                                candidatePath = firstPart;
+                                arguments = rawCmd.Substring(spaceIdx + 1).Trim();
+                            }}
                         }}
                     }}
                 }}
 
-                if (File.Exists(Path.Combine(targetDir, candidatePath)))
+                string candidateRel = StripLeadingRelativeSlashes(candidatePath);
+                string candidateStripped = candidateRel;
+                if (!string.IsNullOrEmpty(SOURCE_FOLDER_NAME) &&
+                    candidateStripped.StartsWith(SOURCE_FOLDER_NAME + "\\", StringComparison.OrdinalIgnoreCase))
                 {{
-                    resolvedFile = Path.GetFullPath(Path.Combine(targetDir, candidatePath));
+                    candidateStripped = StripLeadingRelativeSlashes(candidateStripped.Substring(SOURCE_FOLDER_NAME.Length + 1));
+                }}
+
+                if (!Path.IsPathRooted(candidateRel) && File.Exists(Path.Combine(targetDir, candidateRel)))
+                {{
+                    resolvedFile = Path.GetFullPath(Path.Combine(targetDir, candidateRel));
+                }}
+                else if (!Path.IsPathRooted(candidateStripped) && File.Exists(Path.Combine(targetDir, candidateStripped)))
+                {{
+                    resolvedFile = Path.GetFullPath(Path.Combine(targetDir, candidateStripped));
                 }}
                 else if (File.Exists(candidatePath))
                 {{
@@ -1433,28 +2707,19 @@ namespace ByteWrapperStub
                 else
                 {{
                     string fileNameOnly = Path.GetFileName(candidatePath);
-                    if (!string.IsNullOrEmpty(fileNameOnly))
+                    if (!string.IsNullOrEmpty(fileNameOnly) && !candidateRel.Contains("\\"))
                     {{
-                        string directMatch = Path.Combine(targetDir, fileNameOnly);
-                        if (File.Exists(directMatch))
+                        try
                         {{
-                            resolvedFile = Path.GetFullPath(directMatch);
+                            string[] found = Directory.GetFiles(targetDir, fileNameOnly, SearchOption.AllDirectories);
+                            if (found.Length == 1)
+                                resolvedFile = Path.GetFullPath(found[0]);
                         }}
-                        else
-                        {{
-                            try
-                            {{
-                                string[] found = Directory.GetFiles(targetDir, fileNameOnly, SearchOption.AllDirectories);
-                                if (found.Length > 0)
-                                    resolvedFile = Path.GetFullPath(found[0]);
-                            }}
-                            catch {{ }}
-                        }}
+                        catch {{ }}
                     }}
                 }}
             }}
 
-            // File.Exists can accept relative paths, but WorkingDirectory cannot be empty.
             if (!string.IsNullOrEmpty(resolvedFile))
                 resolvedFile = Path.GetFullPath(resolvedFile);
             string workDir = !string.IsNullOrEmpty(resolvedFile)
@@ -1470,22 +2735,12 @@ namespace ByteWrapperStub
             string fileNameToStart = "";
             string argsToStart = "";
 
-            if (ext == ".reg" || rawCmd.IndexOf("regedit", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (ext == ".reg" && !string.IsNullOrEmpty(resolvedFile))
             {{
                 fileNameToStart = "regedit.exe";
-                if (!string.IsNullOrEmpty(resolvedFile))
-                {{
-                    argsToStart = (HIDDEN_RUN ? "/s " : "") + "\"" + resolvedFile + "\"" +
-                        (string.IsNullOrEmpty(arguments) ? "" : " " + arguments);
-                }}
-                else
-                {{
-                    argsToStart = rawCmd;
-                    if (HIDDEN_RUN && argsToStart.IndexOf("/s", StringComparison.OrdinalIgnoreCase) < 0)
-                        argsToStart = "/s " + argsToStart;
-                }}
-                RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
-                return;
+                argsToStart = (HIDDEN_RUN ? "/s " : "") + "\"" + resolvedFile + "\"" +
+                    (string.IsNullOrEmpty(arguments) ? "" : " " + arguments);
+                return RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
             }}
 
             if (ext == ".ps1")
@@ -1495,8 +2750,7 @@ namespace ByteWrapperStub
                     (HIDDEN_RUN ? "-WindowStyle Hidden " : "") +
                     "-File \"" + resolvedFile + "\"" +
                     (string.IsNullOrEmpty(arguments) ? "" : " " + arguments);
-                RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
-                return;
+                return RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
             }}
 
             if (ext == ".bat" || ext == ".cmd")
@@ -1504,8 +2758,7 @@ namespace ByteWrapperStub
                 fileNameToStart = "cmd.exe";
                 argsToStart = "/D /S /C \"\"" + resolvedFile + "\"" +
                     (string.IsNullOrEmpty(arguments) ? "" : " " + arguments) + "\"";
-                RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
-                return;
+                return RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
             }}
 
             if (ext == ".msi")
@@ -1514,38 +2767,72 @@ namespace ByteWrapperStub
                 argsToStart = "/i \"" + resolvedFile + "\"" +
                     (HIDDEN_RUN ? " /qn /norestart" : "") +
                     (string.IsNullOrEmpty(arguments) ? "" : " " + arguments);
-                RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
-                return;
+                return RunNativeProcess(fileNameToStart, argsToStart, workDir, HIDDEN_RUN);
             }}
 
             if (!string.IsNullOrEmpty(resolvedFile) && File.Exists(resolvedFile))
             {{
-                RunNativeProcess(resolvedFile, arguments, workDir, HIDDEN_RUN);
-                return;
+                return RunNativeProcess(resolvedFile, arguments, workDir, HIDDEN_RUN);
             }}
 
-            RunNativeProcess("cmd.exe", "/D /S /C \"cd /d \"" + workDir + "\" && " + rawCmd + "\"", workDir, HIDDEN_RUN);
+            return RunNativeProcess("cmd.exe", "/D /S /C \"cd /d \"" + workDir + "\" && " + rawCmd + "\"", workDir, HIDDEN_RUN);
         }}
 
-        private static bool TryRunHiddenNative(string fileName, string arguments, string workDir)
+        private static string ResolveExecutableForCreateProcess(string fileName, string workDir)
         {{
+            if (string.IsNullOrWhiteSpace(fileName))
+                return null;
+            if (Path.IsPathRooted(fileName) && File.Exists(fileName))
+                return Path.GetFullPath(fileName);
+            if (!string.IsNullOrEmpty(workDir))
+            {{
+                string localCand = Path.Combine(workDir, fileName);
+                if (File.Exists(localCand))
+                    return Path.GetFullPath(localCand);
+            }}
+            string sys32 = Environment.SystemDirectory;
+            if (!string.IsNullOrEmpty(sys32))
+            {{
+                string sysCand = Path.Combine(sys32, fileName);
+                if (File.Exists(sysCand))
+                    return sysCand;
+                if (string.Equals(fileName, "powershell.exe", StringComparison.OrdinalIgnoreCase))
+                {{
+                    string psCand = Path.Combine(sys32, @"WindowsPowerShell\v1.0\powershell.exe");
+                    if (File.Exists(psCand))
+                        return psCand;
+                }}
+            }}
+            string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            if (!string.IsNullOrEmpty(winDir))
+            {{
+                string winCand = Path.Combine(winDir, fileName);
+                if (File.Exists(winCand))
+                    return winCand;
+            }}
+            return null;
+        }}
+
+        private static bool TryRunHiddenNative(string fileName, string arguments, string workDir, out int pid)
+        {{
+            pid = 0;
             STARTUPINFO startup = new STARTUPINFO();
             startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
             startup.dwFlags = STARTF_USESHOWWINDOW;
             startup.wShowWindow = SW_HIDE;
 
-            string command = "\"" + fileName + "\"" +
+            string resolvedExe = ResolveExecutableForCreateProcess(fileName, workDir);
+            string cmdTarget = resolvedExe ?? fileName;
+            string command = "\"" + cmdTarget + "\"" +
                 (string.IsNullOrWhiteSpace(arguments) ? "" : " " + arguments);
             StringBuilder commandBuffer = new StringBuilder(command);
             PROCESS_INFORMATION processInfo;
-            bool started = CreateProcessW(null, commandBuffer, IntPtr.Zero, IntPtr.Zero,
+            bool started = CreateProcessW(resolvedExe, commandBuffer, IntPtr.Zero, IntPtr.Zero,
                 false, CREATE_NO_WINDOW, IntPtr.Zero, workDir, ref startup, out processInfo);
             if (!started)
                 return false;
 
-            // CreateProcessW succeeded: the child now runs independently.
-            // Close ONLY our process/thread handles. Closing these handles does
-            // not terminate the launched program or its child processes.
+            pid = processInfo.dwProcessId;
             if (processInfo.hThread != IntPtr.Zero)
                 CloseHandle(processInfo.hThread);
             if (processInfo.hProcess != IntPtr.Zero)
@@ -1553,30 +2840,28 @@ namespace ByteWrapperStub
             return true;
         }}
 
-        private static void RunNativeProcess(string fileName, string arguments, string workDir, bool hidden)
+        private static int RunNativeProcess(string fileName, string arguments, string workDir, bool hidden)
         {{
             try
             {{
-                // Apply Win32 STARTUPINFO.SW_HIDE and CREATE_NO_WINDOW together.
-                // ProcessStartInfo alone cannot provide both settings on all
-                // .NET Framework launch paths. This controls the initial
-                // process window; an app can still open its own windows.
-                if (hidden && TryRunHiddenNative(fileName, arguments, workDir))
-                    return;
+                int nativePid;
+                if (hidden && TryRunHiddenNative(fileName, arguments, workDir, out nativePid))
+                    return nativePid;
 
                 ProcessStartInfo psi = new ProcessStartInfo();
                 psi.FileName = fileName;
                 psi.Arguments = arguments;
                 psi.WorkingDirectory = workDir;
-                // Shell fallback supports manifests requiring elevation.
                 psi.UseShellExecute = hidden;
                 psi.CreateNoWindow = false;
                 psi.WindowStyle = hidden ? ProcessWindowStyle.Hidden : ProcessWindowStyle.Normal;
 
                 using (Process p = Process.Start(psi))
                 {{
-                    // Dispose the launcher handle without waiting for the child.
-                    // The extracted Run File keeps running after this stub exits.
+                    if (p != null)
+                    {{
+                        try {{ return p.Id; }} catch {{ }}
+                    }}
                 }}
             }}
             catch (Win32Exception ex)
@@ -1592,7 +2877,10 @@ namespace ByteWrapperStub
                         elevated.UseShellExecute = true;
                         using (Process p = Process.Start(elevated))
                         {{
-                            // UAC launch was accepted: the elevated child is independent.
+                            if (p != null)
+                            {{
+                                try {{ return p.Id; }} catch {{ }}
+                            }}
                         }}
                     }}
                     catch (Exception)
@@ -1611,6 +2899,42 @@ namespace ByteWrapperStub
                     MessageBox.Show("Failed to execute process: " + ex.Message,
                         "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }}
+            return 0;
+        }}
+
+        private static void WaitAndCleanupTempFolder(string tempDir, int pid)
+        {{
+            try
+            {{
+                if (string.IsNullOrEmpty(tempDir) || !Directory.Exists(tempDir))
+                    return;
+
+                if (pid > 0)
+                {{
+                    try
+                    {{
+                        using (Process child = Process.GetProcessById(pid))
+                        {{
+                            child.WaitForExit(6 * 3600 * 1000);
+                        }}
+                    }}
+                    catch {{ }}
+                }}
+                else
+                {{
+                    Thread.Sleep(5000);
+                }}
+
+                for (int i = 0; i < 1800; i++)
+                {{
+                    if (!Directory.Exists(tempDir))
+                        break;
+                    if (TryDeleteDirectoryIfUnused(tempDir, true))
+                        break;
+                    Thread.Sleep(2000);
+                }}
+            }}
+            catch {{ }}
         }}
 
         private static void SelfDeleteExe()
@@ -1620,33 +2944,51 @@ namespace ByteWrapperStub
                 string exePath = Application.ExecutablePath;
                 ProcessStartInfo psi = new ProcessStartInfo();
                 psi.FileName = "cmd.exe";
-                psi.Arguments = "/D /C for /L %i in (1,1,15) do @(if exist \"" + exePath + "\" (del /f /q \"" + exePath + "\" >nul 2>&1 & if exist \"" + exePath + "\" ping 127.0.0.1 -n 2 >nul))";
+                psi.Arguments = "/D /C ping 127.0.0.1 -n 2 >nul & for /L %i in (1,1,15) do @(del /f /q \"" + exePath + "\" >nul 2>&1 & if exist \"" + exePath + "\" ping 127.0.0.1 -n 2 >nul)";
                 psi.WorkingDirectory = Path.GetTempPath();
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
-                Process.Start(psi);
+                using (Process p = Process.Start(psi)) {{ }}
             }}
             catch {{ }}
         }}
 
-        private static void ExtractOverlayArchive(string outPath)
+        private static void ExtractOverlayArchive(string outPath, bool unscramble, Action<int> reportProgress)
         {{
             if (OVERLAY_ARCHIVE_SIZE < 32L)
-                throw new InvalidDataException("No readable 7z overlay is configured.");
+                throw new InvalidDataException("No valid payload overlay is configured.");
 
             using (FileStream source = new FileStream(Application.ExecutablePath, FileMode.Open, FileAccess.Read, FileShare.Read))
             {{
                 if (source.Length < OVERLAY_ARCHIVE_SIZE)
-                    throw new InvalidDataException("The 7z overlay is missing or incomplete.");
+                    throw new InvalidDataException("The payload overlay is missing or incomplete.");
 
                 long offset = source.Length - OVERLAY_ARCHIVE_SIZE;
                 source.Seek(offset, SeekOrigin.Begin);
-                byte[] magic = new byte[] {{ 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C }};
-                for (int i = 0; i < magic.Length; i++)
-                    if (source.ReadByte() != magic[i])
-                        throw new InvalidDataException("The 7z overlay signature is invalid.");
-                source.Seek(offset, SeekOrigin.Begin);
+
+                if (!unscramble)
+                {{
+                    byte[] magic = new byte[] {{ 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C }};
+                    for (int i = 0; i < magic.Length; i++)
+                        if (source.ReadByte() != magic[i])
+                            throw new InvalidDataException("The 7z overlay signature is invalid.");
+                    source.Seek(offset, SeekOrigin.Begin);
+                }}
+
+                byte[] key = Encoding.ASCII.GetBytes("byte_wrapper_secret_key");
+                int klen = key.Length;
+                int period = klen * 256;
+                byte[] mask = new byte[period];
+                if (unscramble)
+                {{
+                    for (int m = 0; m < period; m++)
+                        mask[m] = (byte)(key[m % klen] ^ ((m & 0xFF) ^ 0xA5));
+                }}
+
+                long totalOffset = 0;
+                int maskIdx = 0;
+                int lastReported = -1;
 
                 using (FileStream dest = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {{
@@ -1657,56 +2999,65 @@ namespace ByteWrapperStub
                         int want = (int)Math.Min((long)buffer.Length, remaining);
                         int read = source.Read(buffer, 0, want);
                         if (read <= 0)
-                            throw new EndOfStreamException("The 7z overlay ended early.");
+                            throw new EndOfStreamException("The payload overlay ended early.");
+
+                        if (unscramble)
+                        {{
+                            for (int i = 0; i < read; i++)
+                            {{
+                                buffer[i] ^= mask[maskIdx];
+                                if (++maskIdx == period)
+                                    maskIdx = 0;
+                            }}
+                        }}
+
                         dest.Write(buffer, 0, read);
+                        totalOffset += read;
                         remaining -= read;
+
+                        if (reportProgress != null && OVERLAY_ARCHIVE_SIZE > 0)
+                        {{
+                            int pct = (int)((totalOffset * 50L) / OVERLAY_ARCHIVE_SIZE);
+                            if (pct != lastReported)
+                            {{
+                                lastReported = pct;
+                                reportProgress(pct);
+                            }}
+                        }}
                     }}
                 }}
             }}
         }}
 
-        private static void ExtractResourceIfExists(string resName, string outPath, bool unscramble)
+        private static void ExtractResourceIfExists(string resName, string outPath)
         {{
             using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(resName))
             {{
                 if (s == null) return;
             }}
-            ExtractResource(resName, outPath, unscramble);
+            ExtractResource(resName, outPath);
         }}
 
-        private static void ExtractResource(string resName, string outPath, bool unscramble)
+        private static void ExtractResource(string resName, string outPath)
         {{
             using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(resName))
             {{
                 if (s == null)
                     throw new Exception("Resource not found: " + resName);
 
-                byte[] key = Encoding.ASCII.GetBytes("byte_wrapper_secret_key_2026");
-                int klen = key.Length;
                 byte[] buffer = new byte[65536];
-                long totalOffset = 0;
-
                 using (FileStream fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {{
                     int read;
                     while ((read = s.Read(buffer, 0, buffer.Length)) > 0)
                     {{
-                        if (unscramble)
-                        {{
-                            for (int i = 0; i < read; i++)
-                            {{
-                                long idx = totalOffset + i;
-                                buffer[i] = (byte)(buffer[i] ^ key[idx % klen] ^ ((idx & 0xFF) ^ 0xA5));
-                            }}
-                        }}
                         fs.Write(buffer, 0, read);
-                        totalOffset += read;
                     }}
                 }}
             }}
         }}
 
-        private static Form CreateProgressForm()
+        private static Form CreateProgressForm(out ProgressBar pb, out Label lbl)
         {{
             Form f = new Form();
             f.Text = "{prod_name_str}";
@@ -1719,16 +3070,18 @@ namespace ByteWrapperStub
             f.BackColor = Color.FromArgb(11, 16, 22);
             f.ForeColor = Color.FromArgb(226, 232, 240);
 
-            Label lbl = new Label();
-            lbl.Text = "Extracting package, please wait...";
+            lbl = new Label();
+            lbl.Text = "Extracting package... 0%";
             lbl.AutoSize = false;
             lbl.Bounds = new Rectangle(16, 14, 300, 20);
             lbl.Font = new Font("Segoe UI", 9F, FontStyle.Regular);
             f.Controls.Add(lbl);
 
-            ProgressBar pb = new ProgressBar();
-            pb.Style = ProgressBarStyle.Marquee;
-            pb.MarqueeAnimationSpeed = 25;
+            pb = new ProgressBar();
+            pb.Minimum = 0;
+            pb.Maximum = 100;
+            pb.Value = 0;
+            pb.Style = ProgressBarStyle.Blocks;
             pb.Bounds = new Rectangle(16, 40, 292, 18);
             f.Controls.Add(pb);
 
@@ -1786,6 +3139,12 @@ namespace ByteWrapperStub
     }}
 }}
 """
+
+        cs_code = build_cs_source(internal_7z_pw, expected_user_pw_hash)
+        preview_pw = "***REDACTED***" if internal_7z_pw else ""
+        preview_hash = "***REDACTED***" if expected_user_pw_hash else ""
+        preview_cs_code = build_cs_source(preview_pw, preview_hash)
+
         cs_file = os.path.join(work_dir, "Stub.cs")
         with open(cs_file, "w", encoding="utf-8-sig") as f:
             f.write(cs_code)
@@ -1795,14 +3154,12 @@ namespace ByteWrapperStub
             "/nologo",
             "/target:winexe",
             "/optimize+",
-            f"/out:{target_exe}",
+            f"/out:{staging_exe}",
             f"/win32manifest:{manifest_path}",
             f'/resource:{os.path.join(work_dir, "7z.exe")},7z.exe',
         ]
         if has_dll:
             csc_cmd.append(f'/resource:{os.path.join(work_dir, "7z.dll")},7z.dll')
-        if scrambled:
-            csc_cmd.append(f'/resource:{payload_dat},payload.dat')
 
         icon_ico = self.cfg.get("icon_ico", "")
         if not (icon_ico and os.path.isfile(icon_ico)):
@@ -1813,32 +3170,72 @@ namespace ByteWrapperStub
         csc_cmd.append(cs_file)
 
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        res = subprocess.run(csc_cmd, capture_output=True, text=True, creationflags=creation_flags)
-        if res.returncode != 0 or not os.path.isfile(target_exe):
-            return False, f"C# Stub Compilation Error:\n{res.stdout}\n{res.stderr}"
+        proc = subprocess.Popen(
+            csc_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creation_flags
+        )
+        with self._proc_lock:
+            self._active_proc = proc
 
-        # Retain the generated C# for the header-logo SFX code viewer.
-        # The source preview MUST precede the overlay archive: the final
-        # OVERLAY_ARCHIVE_SIZE bytes are the raw, byte-identical .7z payload.
-        with open(target_exe, 'ab') as output:
-            output.write(b'\r\n;!@ByteWrapperSource@UTF-8!\r\n')
-            output.write(cs_code.encode('utf-8'))
-            output.write(b'\r\n;!@ByteWrapperSourceEnd@!\r\n')
+        if self._cancelled:
+            self._terminate_process_tree(proc)
+            with self._proc_lock:
+                self._active_proc = None
+            return False, "Canceled by user."
 
-        if not scrambled:
-            # In transparent mode the archive is appended exactly once. The
-            # stub streams it back from the EXE's final bytes when launched.
-            with open(payload_dat, "rb") as archive, open(target_exe, "ab") as output:
-                shutil.copyfileobj(archive, output)
+        try:
+            stdout, stderr = proc.communicate(timeout=self.CSC_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            self._terminate_process_tree(proc)
+            return False, "C# Stub compiler (csc.exe) timed out."
+        finally:
+            with self._proc_lock:
+                self._active_proc = None
 
-        return True, target_exe
+        if self._cancelled:
+            return False, "Canceled by user."
+
+        if proc.returncode != 0 or not os.path.isfile(staging_exe):
+            return False, f"C# Stub Compilation Error:\n{stdout}\n{stderr}"
+
+        try:
+            with open(staging_exe, 'ab') as output:
+                output.write(b'\r\n' + _BW_SOURCE_START_MARKER + b'\r\n')
+                output.write(preview_cs_code.encode('utf-8'))
+                output.write(b'\r\n' + _BW_SOURCE_END_MARKER + b'\r\n')
+
+            with open(payload_dat, "rb") as archive, open(staging_exe, "ab") as output:
+                while True:
+                    if self._cancelled:
+                        raise RuntimeError("Canceled by user.")
+                    buf = archive.read(1024 * 1024)
+                    if not buf:
+                        break
+                    output.write(buf)
+
+            if self._cancelled:
+                raise RuntimeError("Canceled by user.")
+        except Exception as exc:
+            return False, str(exc)
+
+        return True, staging_exe
 
     def run(self):
         work_dir = None
+        staging_exe = ""
         success = False
         message = ""
         try:
             self.progress.emit(5)
+            if self._cancelled:
+                message = "Canceled by user."
+                return
+
             seven_zip = self.find_7zip()
             if not seven_zip:
                 message = "7-Zip (7z.exe) was not found! Please make sure 7-Zip is installed."
@@ -1849,51 +3246,90 @@ namespace ByteWrapperStub
                 message = "Windows .NET C# compiler (csc.exe) was not found!"
                 return
 
-            source_path = os.path.expandvars(self.cfg["source"].strip())
-            if not os.path.exists(source_path):
+            source_path = normalize_user_path(self.cfg["source"])
+            if not source_path or not os.path.exists(source_path):
                 message = f"Source Folder / File path does not exist:\n{source_path}"
                 return
 
-            out_dir = os.path.expandvars(self.cfg["output"].strip())
+            out_dir = normalize_user_path(self.cfg["output"])
             if not out_dir:
                 message = "Please specify a valid Output save path!"
                 return
 
+            run_script_path = ""
+            if not self.cfg.get("extract_only", False):
+                run_script_path = _resolve_unique_run_file_in_source(source_path, self.cfg.get("run_file", ""))
+                if not run_script_path:
+                    message = "Run File is missing or ambiguous inside Source Folder."
+                    return
+
             target_exe = self.resolve_output_exe_path()
+
+            # Prevent overwriting the source file or the selected Run File itself
+            if os.path.isfile(source_path) and paths_refer_to_same_location(source_path, target_exe):
+                message = "Output EXE path cannot be the same as the Source file!"
+                return
+            if run_script_path and paths_refer_to_same_location(run_script_path, target_exe):
+                message = "Output EXE path cannot overwrite the selected Run File!"
+                return
+
+            # Unique temporary staging file in the output directory; existing target_exe is untouched on cancel/error
+            staging_exe = os.path.join(
+                os.path.dirname(target_exe),
+                f".bw_staging_{os.getpid()}_{uuid.uuid4().hex[:8]}.tmp"
+            )
             self.progress.emit(20)
 
-            # No TemporaryDirectory finalizer: if an antivirus scanner briefly
-            # holds payload.dat, retry cleanup instead of raising at Python exit.
             work_dir = tempfile.mkdtemp(prefix="byte_wrapper_build_")
             raw_7z = os.path.join(work_dir, "raw_package.7z")
-            res_7z = self.build_7z_archive(seven_zip, source_path, raw_7z)
+            res_7z = self.build_7z_archive(seven_zip, source_path, raw_7z, target_exe, run_script_path)
+            if self._cancelled:
+                message = "Canceled by user."
+                return
             if res_7z.returncode != 0:
-                message = f"7-Zip Compression Error:\n{res_7z.stderr or res_7z.stdout}"
+                message = f"7-Zip Compression Error:\n{res_7z.stdout}"
                 return
 
             self.progress.emit(60)
             scrambled_dat = os.path.join(work_dir, "payload.dat")
             payload_path, scrambled = self.prepare_payload(raw_7z, scrambled_dat)
+            if self._cancelled:
+                message = "Canceled by user."
+                return
             self.progress.emit(75)
 
-            ok, msg = self.compile_csharp_sfx(csc_path, work_dir, payload_path,
-                                               scrambled, seven_zip, target_exe)
+            ok, msg = self.compile_csharp_sfx(
+                csc_path, work_dir, payload_path, scrambled, seven_zip, staging_exe
+            )
             if not ok:
                 message = msg
                 return
 
+            # Final post-packaging cancellation check before atomic commit
+            if self._cancelled:
+                message = "Canceled by user."
+                return
+
+            final_exe = self._commit_staging_exe(staging_exe, target_exe)
+            staging_exe = ""
+            self.output_exe_path = final_exe
+
             self.progress.emit(100)
             success = True
-            message = f"Package successfully created at:\n{target_exe}"
+            message = f"Package successfully created at:\n{final_exe}"
 
         except Exception as e:
             message = f"Unexpected error: {str(e)}"
         finally:
+            self._release_reservation_lock()
+            if staging_exe and os.path.isfile(staging_exe):
+                try:
+                    os.unlink(staging_exe)
+                except OSError:
+                    pass
             if work_dir:
                 _remove_build_directory_safely(work_dir)
-            # Announce completion only AFTER source file handles close and
-            # transient build-directory cleanup has been attempted.
-            self.finished.emit(success, message)
+            self.build_finished.emit(success, message)
 
 
 # ==========================================
@@ -1905,6 +3341,7 @@ class ByteWrapperWindow(QWidget):
         self.setWindowTitle("Byte Wrapper")
         self.setFixedSize(380, 600)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        self.setAcceptDrops(True)
         self.drag_pos = QPoint()
 
         self.app_icon_path = get_app_icon_path()
@@ -1915,6 +3352,13 @@ class ByteWrapperWindow(QWidget):
 
         self.current_icon_source = self.app_icon_path
         self.converted_ico_path = self.app_icon_path
+        self._session_temp_icons: set[str] = set()
+
+        cleanup_stale_temp_files(protected_paths={
+            self.app_icon_path,
+            self.current_icon_source,
+            self.converted_ico_path,
+        })
 
         dpr = max(1.0, self.devicePixelRatioF())
         self.default_gui_icon = load_crisp_gui_icon(self.app_icon_path, dpr)
@@ -1925,6 +3369,9 @@ class ByteWrapperWindow(QWidget):
         self._user_edited_name = False
         self._tracked_source_path = ""
         self._importing_config = False
+        self._close_pending = False
+        self.worker: SFXBuilderWorker | None = None
+        self.last_output_exe: str = ""
         self._blink_timer = QTimer(self)
         self._blink_timer.timeout.connect(self._on_blink_step)
         self._blink_step_count = 0
@@ -1934,6 +3381,19 @@ class ByteWrapperWindow(QWidget):
 
     def _save_fallback_box_ico(self, out_ico: str):
         draw_default_sfx_icon(out_ico)
+
+    def _register_session_icon(self, new_ico_path: str):
+        """Track newly created temp ICO and clean up older unused session icons."""
+        for old_ico in list(self._session_temp_icons):
+            if old_ico != new_ico_path and old_ico != self.app_icon_path:
+                if os.path.isfile(old_ico) and not _is_file_in_use(old_ico):
+                    try:
+                        os.unlink(old_ico)
+                        self._session_temp_icons.discard(old_ico)
+                    except OSError:
+                        pass
+        if new_ico_path and new_ico_path != self.app_icon_path:
+            self._session_temp_icons.add(new_ico_path)
 
     def _apply_icon_to_button(self, ico_path: str):
         """Render the selected ICO onto the 24x24 button at exact physical screen DPI."""
@@ -2008,10 +3468,10 @@ class ByteWrapperWindow(QWidget):
         self.inp_output = SmartLineEdit("Define save path...", mode="output", parent_win=self)
         main_layout.addWidget(self.inp_output)
 
-        main_layout.addWidget(self._make_section_label("Name & Description"))
+        main_layout.addWidget(self._make_section_label("Name, Description & Version"))
         nd_layout = QHBoxLayout()
         nd_layout.setContentsMargins(0, 0, 0, 0)
-        nd_layout.setSpacing(8)
+        nd_layout.setSpacing(6)
 
         self.btn_icon = QPushButton()
         self.btn_icon.setObjectName("IconSelectBtn")
@@ -2027,12 +3487,23 @@ class ByteWrapperWindow(QWidget):
         self.inp_name.setPlaceholderText("Name...")
         self.inp_name.setFixedHeight(34)
         self.inp_name.textEdited.connect(self.on_name_manually_edited)
-        nd_layout.addWidget(self.inp_name, stretch=1)
+        nd_layout.addWidget(self.inp_name, stretch=4)
 
         self.inp_desc = QLineEdit()
         self.inp_desc.setPlaceholderText("Description...")
         self.inp_desc.setFixedHeight(34)
-        nd_layout.addWidget(self.inp_desc, stretch=1)
+        nd_layout.addWidget(self.inp_desc, stretch=4)
+
+        self.inp_version = QLineEdit()
+        self.inp_version.setObjectName("VersionInput")
+        self.inp_version.setPlaceholderText("Ver...")
+        self.inp_version.setToolTip("Package file version (e.g. 1.0.0.0)")
+        self.inp_version.setFixedSize(64, 34)
+        ver_validator = QRegularExpressionValidator(
+            QRegularExpression(r"^[0-9]{0,5}(\.[0-9]{0,5}){0,3}$"), self.inp_version
+        )
+        self.inp_version.setValidator(ver_validator)
+        nd_layout.addWidget(self.inp_version)
 
         main_layout.addLayout(nd_layout)
 
@@ -2137,7 +3608,7 @@ class ByteWrapperWindow(QWidget):
 
         for field in (
             self.inp_source, self.inp_extract, self.inp_run, self.inp_output,
-            self.inp_name, self.inp_desc, self.inp_password
+            self.inp_name, self.inp_desc, self.inp_version, self.inp_password
         ):
             field.textChanged.connect(self.reset_start_status)
         for option in all_checks:
@@ -2145,6 +3616,8 @@ class ByteWrapperWindow(QWidget):
         self._refresh_hidden_availability()
 
     def reset_start_status(self, *args):
+        if self.worker is not None and self.worker.isRunning():
+            return
         self.btn_start.setText("Start Process")
         self.btn_start.setToolTip("")
 
@@ -2194,7 +3667,7 @@ class ByteWrapperWindow(QWidget):
                 background-color: #131b23;
                 border: 1px solid #1e2936;
                 border-radius: 4px;
-                padding: 0px 10px;
+                padding: 0px 8px;
                 color: #e2e8f0;
                 font-size: 12px;
             }
@@ -2205,6 +3678,10 @@ class ByteWrapperWindow(QWidget):
                 background-color: #0d1218;
                 color: #475569;
                 border: 1px solid #151d26;
+            }
+            QLineEdit#VersionInput {
+                padding: 0px 6px;
+                font-size: 11px;
             }
             QLineEdit#PasswordInput {
                 padding: 0px 8px;
@@ -2283,7 +3760,26 @@ class ByteWrapperWindow(QWidget):
             }
         """)
 
-    # --- WINDOW DRAGGING ---
+    # --- WINDOW DRAGGING & JSON CONFIG DROP ---
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                local_path = url.toLocalFile()
+                if local_path and os.path.isfile(local_path) and local_path.lower().endswith(".json"):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                local_path = url.toLocalFile()
+                if local_path and os.path.isfile(local_path) and local_path.lower().endswith(".json"):
+                    self.import_config_from_path(normalize_user_path(local_path))
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and event.position().y() < 55:
             self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -2299,7 +3795,7 @@ class ByteWrapperWindow(QWidget):
 
     # --- HANDLERS & FEATURES ---
     def inspect_sfx_file(self, file_path: str):
-        ok, result = process_file(os.path.normpath(file_path))
+        ok, result = process_file(normalize_user_path(file_path))
         if not ok:
             QMessageBox.information(self, 'SFX Code Viewer', result)
 
@@ -2319,6 +3815,12 @@ class ByteWrapperWindow(QWidget):
         if checked and self.chk_hidden.isChecked():
             self.chk_hidden.setChecked(False)
         self.inp_run.setEnabled(not checked)
+        if checked and not self._user_edited_name and not self.inp_name.text().strip():
+            expanded = normalize_user_path(self.inp_source.text())
+            if expanded and os.path.isdir(expanded):
+                folder_stem = os.path.basename(expanded)
+                if folder_stem:
+                    self.inp_name.setText(folder_stem)
         self._refresh_hidden_availability()
 
     def on_hidden_run_toggled(self, checked: bool):
@@ -2354,12 +3856,11 @@ class ByteWrapperWindow(QWidget):
 
     @staticmethod
     def _normalize_source_path(path: str) -> str:
-        """Compare folder selections independently of trailing separators or letter case."""
-        path = path.strip().strip('"')
-        if not path:
+        """Compare folder selections independently of trailing separators, quotes, or letter case."""
+        expanded = normalize_user_path(path)
+        if not expanded:
             return ""
-        expanded = os.path.expanduser(os.path.expandvars(path))
-        return os.path.normcase(os.path.abspath(os.path.normpath(expanded)))
+        return os.path.normcase(os.path.abspath(expanded))
 
     def _clear_source_dependent_fields(self):
         """A changed source invalidates the selected run command, name and custom icon."""
@@ -2377,49 +3878,32 @@ class ByteWrapperWindow(QWidget):
             return
         if normalized != previous:
             self._clear_source_dependent_fields()
+            expanded = normalize_user_path(path)
+            if expanded and os.path.isfile(expanded):
+                ext = os.path.splitext(expanded)[1].lower()
+                if ext in (".exe", ".msi", ".bat", ".cmd", ".ps1", ".reg"):
+                    self.inp_run.setText(os.path.basename(expanded))
+                    self.set_icon_from_run_file()
+                else:
+                    stem = os.path.splitext(os.path.basename(expanded))[0]
+                    if stem and not self._user_edited_name:
+                        self.inp_name.setText(stem)
+            elif expanded and os.path.isdir(expanded) and self.chk_extract_only.isChecked():
+                folder_stem = os.path.basename(expanded)
+                if folder_stem and not self._user_edited_name:
+                    self.inp_name.setText(folder_stem)
 
     def on_source_dropped(self, path: str):
         """On a new folder clear immediately; on the same folder recheck Run File."""
         previous = self._tracked_source_path
         normalized = self._normalize_source_path(path)
         self.inp_source.setText(path)
-        # setText does not emit textChanged when the same folder is dropped twice.
         if normalized == previous:
             self._revalidate_run_file_in_source()
 
     def _run_file_still_in_source(self) -> bool:
-        """Only accept actual files under the selected source, not PATH or unrelated folders."""
-        src = self._normalize_source_path(self.inp_source.text())
-        candidate = self._extract_candidate_from_run_text(self.inp_run.text()).strip().strip('"')
-        if not src or not candidate:
-            return False
-        candidate = os.path.expanduser(os.path.expandvars(candidate))
-        if not os.path.exists(src):
-            return False
-        if os.path.isfile(src):
-            candidate_path = candidate if os.path.isabs(candidate) else os.path.join(os.path.dirname(src), candidate)
-            return (os.path.isfile(candidate_path) and
-                    self._normalize_source_path(candidate_path) == src)
-
-        if not os.path.isdir(src):
-            return False
-        candidate_path = candidate if os.path.isabs(candidate) else os.path.join(src, candidate)
-        candidate_path = self._normalize_source_path(candidate_path)
-        try:
-            if os.path.commonpath((src, candidate_path)) != src:
-                return False
-        except ValueError:  # Different Windows drives
-            return False
-        if os.path.isfile(candidate_path):
-            return True
-
-        # A bare filename can be anywhere inside the source, matching the
-        # existing icon lookup and the generated launcher's recursive lookup.
-        if os.path.basename(candidate) == candidate and not os.path.isabs(candidate):
-            for folder, _, files in os.walk(src):
-                if any(name.casefold() == candidate.casefold() for name in files):
-                    return True
-        return False
+        """Only accept unambiguous files under the selected source, not PATH or unrelated folders."""
+        return bool(_resolve_unique_run_file_in_source(self.inp_source.text(), self.inp_run.text()))
 
     def _revalidate_run_file_in_source(self):
         if self.inp_run.text().strip() and not self._run_file_still_in_source():
@@ -2429,16 +3913,8 @@ class ByteWrapperWindow(QWidget):
         self._user_edited_name = bool(text.strip())
 
     def _extract_candidate_from_run_text(self, raw: str) -> str:
-        raw = raw.strip()
-        if not raw:
-            return ''
-        if raw.startswith('"'):
-            end_q = raw.find('"', 1)
-            return raw[1:end_q] if end_q > 1 else raw.strip('"')
-        match = re.match(r'^(.+?\.(?:bat|cmd|ps1|exe|msi|reg))(?=\s|$)', raw, re.IGNORECASE)
-        if match:
-            return match.group(1)
-        return raw.split()[0]
+        cmd_part, _ = _split_command_and_args(raw, self.inp_source.text())
+        return cmd_part
 
     def on_run_file_changed(self, text: str):
         self._refresh_hidden_availability()
@@ -2457,6 +3933,7 @@ class ByteWrapperWindow(QWidget):
     def reset_icon_to_default(self, _pos=None):
         self.current_icon_source = self.app_icon_path
         self.converted_ico_path = self.app_icon_path
+        self._register_session_icon(self.app_icon_path)
         self._apply_icon_to_button(self.app_icon_path)
         self.btn_icon.setToolTip('Default Byte Wrapper icon restored. Left-click to select another.')
         self.reset_start_status()
@@ -2494,43 +3971,43 @@ class ByteWrapperWindow(QWidget):
         if not raw_run:
             return ""
 
-        candidate = os.path.expandvars(self._extract_candidate_from_run_text(raw_run).replace("/", "\\"))
-        if os.path.isfile(candidate):
+        unique_in_src = _resolve_unique_run_file_in_source(self.inp_source.text(), raw_run)
+        if unique_in_src:
+            return unique_in_src
+
+        raw_cand = self._extract_candidate_from_run_text(raw_run)
+        candidate = (
+            normalize_user_path(raw_cand) if _is_unc_or_drive_abs(raw_cand)
+            else _strip_relative_leading_slashes(raw_cand)
+        )
+        if candidate and os.path.isabs(candidate) and os.path.isfile(candidate):
             return candidate
 
-        src = os.path.expandvars(self.inp_source.text().strip().replace("/", "\\"))
-        if os.path.isfile(src):
+        src = normalize_user_path(self.inp_source.text())
+        if src and os.path.isfile(src):
             return src
-        if os.path.isdir(src):
-            direct = os.path.join(src, candidate)
-            if os.path.isfile(direct):
-                return direct
-            fname = os.path.basename(candidate)
-            if fname:
-                for root_dir, _, files in os.walk(src):
-                    for f in files:
-                        if f.lower() == fname.lower():
-                            return os.path.join(root_dir, f)
-
-        which_path = shutil.which(candidate) or shutil.which(os.path.basename(candidate))
-        if which_path and os.path.isfile(which_path):
-            return which_path
 
         return ""
 
     def set_icon_from_run_file(self):
         target_file = self._resolve_run_file_for_icon()
         if not target_file:
-            self.btn_icon.setToolTip("Could not locate an icon from Run File or Source Folder.")
+            self.btn_icon.setToolTip("Could not locate an unambiguous icon from Run File or Source Folder.")
             return
 
-        out_ico = os.path.join(tempfile.gettempdir(), "byte_wrapper_selected_icon.ico")
-        if extract_icon_from_file(target_file, out_ico):
+        out_ico = create_unique_temp_icon_path()
+        if extract_icon_from_file(target_file, out_ico) and os.path.isfile(out_ico):
             self.current_icon_source = target_file
             self.converted_ico_path = out_ico
+            self._register_session_icon(out_ico)
             self._apply_icon_to_button(out_ico)
             self.reset_start_status()
         else:
+            if os.path.isfile(out_ico):
+                try:
+                    os.unlink(out_ico)
+                except OSError:
+                    pass
             self.btn_icon.setToolTip(f"Could not extract icon from: {target_file}")
 
     def select_icon_from_dialog(self):
@@ -2544,21 +4021,25 @@ class ByteWrapperWindow(QWidget):
             return
 
         ext = os.path.splitext(file_path)[1].lower()
-        out_ico = os.path.join(tempfile.gettempdir(), "byte_wrapper_selected_icon.ico")
+        out_ico = create_unique_temp_icon_path()
 
         if ext in (".exe", ".ico"):
             success = extract_icon_from_file(file_path, out_ico)
-            if not success:
-                self.btn_icon.setToolTip("Could not extract icon from the selected file.")
-                return
         else:
             success = convert_image_to_ico(file_path, out_ico)
-            if not success:
-                self.btn_icon.setToolTip("Could not convert the selected image to .ico format.")
-                return
+
+        if not success or not os.path.isfile(out_ico):
+            if os.path.isfile(out_ico):
+                try:
+                    os.unlink(out_ico)
+                except OSError:
+                    pass
+            self.btn_icon.setToolTip("Could not extract or convert the selected icon.")
+            return
 
         self.current_icon_source = file_path
         self.converted_ico_path = out_ico
+        self._register_session_icon(out_ico)
         self._apply_icon_to_button(out_ico)
         self.reset_start_status()
 
@@ -2585,6 +4066,9 @@ class ByteWrapperWindow(QWidget):
             self.inp_password.setEchoMode(QLineEdit.EchoMode.Normal)
 
     def collect_config(self) -> dict:
+        pw = self.inp_password.text()
+        if not pw.strip():
+            pw = ""
         return {
             "source": self.inp_source.text(),
             "extract_to": self.inp_extract.text(),
@@ -2592,6 +4076,7 @@ class ByteWrapperWindow(QWidget):
             "output": self.inp_output.text(),
             "name": self.inp_name.text(),
             "description": self.inp_desc.text(),
+            "version": self.inp_version.text(),
             "icon_source": self.current_icon_source,
             "icon_ico": self.converted_ico_path,
             "run_as_admin": self.chk_admin.isChecked(),
@@ -2603,8 +4088,8 @@ class ByteWrapperWindow(QWidget):
             "compress": self.chk_compress.isChecked(),
             "crypto": self.chk_crypto.isChecked(),
             "instances": self.chk_instances.isChecked(),
-            "use_password": bool(self.inp_password.text().strip()),
-            "password": self.inp_password.text(),
+            "use_password": bool(pw),
+            "password": pw,
         }
 
     def export_config(self):
@@ -2624,109 +4109,262 @@ class ByteWrapperWindow(QWidget):
         except Exception as e:
             self.btn_export.setToolTip(f"Failed to export configuration: {e}")
 
-    def import_config(self):
-        open_path, _ = QFileDialog.getOpenFileName(
-            self, "Import Configuration Script", "", "JSON Script (*.json)"
+    @staticmethod
+    def _validate_and_normalize_config(raw_cfg: object) -> dict:
+        if not isinstance(raw_cfg, dict):
+            raise ValueError("Configuration root must be a JSON object.")
+
+        str_keys = ("source", "extract_to", "run_file", "output", "name", "description", "version", "icon_source", "password")
+        bool_keys = (
+            "run_as_admin", "hidden_run", "dont_replace", "extract_only",
+            "self_remove", "progress_bar", "compress", "crypto", "instances"
         )
+
+        validated = {}
+        for k in str_keys:
+            val = raw_cfg.get(k, "")
+            if val is None:
+                val = ""
+            if not isinstance(val, str):
+                raise TypeError(f"Field '{k}' must be a string.")
+            validated[k] = val
+
+        for k in bool_keys:
+            val = raw_cfg.get(k, False)
+            if not isinstance(val, bool):
+                raise TypeError(f"Field '{k}' must be a boolean.")
+            validated[k] = val
+
+        if validated["extract_only"] and validated["hidden_run"]:
+            validated["hidden_run"] = False
+
+        validated["decrypted_password"] = decrypt_password_from_import(validated["password"])
+        return validated
+
+    def import_config_from_path(self, open_path: str):
         if not open_path:
             return
         try:
             with open(open_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
+                raw_cfg = json.load(f)
+
+            cfg = self._validate_and_normalize_config(raw_cfg)
 
             self._importing_config = True
-            self._user_edited_name = bool(cfg.get("name", "").strip())
-            self.inp_source.setText(cfg.get("source", ""))
-            self.inp_extract.setText(cfg.get("extract_to", ""))
-            self.inp_run.setText(cfg.get("run_file", ""))
-            self.inp_output.setText(cfg.get("output", ""))
-            self.inp_name.setText(cfg.get("name", ""))
-            self.inp_desc.setText(cfg.get("description", ""))
+            self._user_edited_name = bool(cfg["name"].strip())
+            self._tracked_source_path = self._normalize_source_path(cfg["source"])
+            self.inp_source.setText(cfg["source"])
+            self.inp_extract.setText(cfg["extract_to"])
+            self.inp_run.setText(cfg["run_file"])
+            self.inp_output.setText(cfg["output"])
+            self.inp_name.setText(cfg["name"])
+            self.inp_desc.setText(cfg["description"])
+            self.inp_version.setText(cfg["version"])
 
-            self.chk_admin.setChecked(cfg.get("run_as_admin", False))
-            self.chk_hidden.setChecked(cfg.get("hidden_run", False))
-            self.chk_dont_replace.setChecked(cfg.get("dont_replace", False))
-            self.chk_extract_only.setChecked(cfg.get("extract_only", False))
-            self.chk_self_remove.setChecked(cfg.get("self_remove", False))
-            self.chk_progress_bar.setChecked(cfg.get("progress_bar", False))
-            self.chk_compress.setChecked(cfg.get("compress", False))
-            self.chk_crypto.setChecked(cfg.get("crypto", False))
-            self.chk_instances.setChecked(cfg.get("instances", False))
+            if not cfg["name"].strip() and cfg["run_file"].strip():
+                self.on_run_file_changed(cfg["run_file"])
+
+            self.chk_admin.setChecked(cfg["run_as_admin"])
+            self.chk_hidden.setChecked(cfg["hidden_run"])
+            self.chk_dont_replace.setChecked(cfg["dont_replace"])
+            self.chk_extract_only.setChecked(cfg["extract_only"])
+            self.chk_self_remove.setChecked(cfg["self_remove"])
+            self.chk_progress_bar.setChecked(cfg["progress_bar"])
+            self.chk_compress.setChecked(cfg["compress"])
+            self.chk_crypto.setChecked(cfg["crypto"])
+            self.chk_instances.setChecked(cfg["instances"])
             self._refresh_hidden_availability()
 
-            decrypted_pw = decrypt_password_from_import(cfg.get("password", ""))
+            decrypted_pw = cfg["decrypted_password"]
             self.inp_password.setText(decrypted_pw)
             if decrypted_pw:
                 self.trigger_password_blink()
 
-            icon_src = cfg.get("icon_source", "")
-            if icon_src and os.path.exists(icon_src):
-                out_ico = os.path.join(tempfile.gettempdir(), "byte_wrapper_selected_icon.ico")
+            icon_src = normalize_user_path(cfg["icon_source"])
+            icon_loaded = False
+            if icon_src and os.path.isfile(icon_src):
+                out_ico = create_unique_temp_icon_path()
                 if icon_src.lower().endswith((".exe", ".ico")):
-                    extract_icon_from_file(icon_src, out_ico)
+                    ok_ico = extract_icon_from_file(icon_src, out_ico)
                 else:
-                    convert_image_to_ico(icon_src, out_ico)
-                if os.path.exists(out_ico):
+                    ok_ico = convert_image_to_ico(icon_src, out_ico)
+                if ok_ico and os.path.isfile(out_ico):
                     self.current_icon_source = icon_src
                     self.converted_ico_path = out_ico
+                    self._register_session_icon(out_ico)
                     self._apply_icon_to_button(out_ico)
-            else:
+                    icon_loaded = True
+                elif os.path.isfile(out_ico):
+                    try:
+                        os.unlink(out_ico)
+                    except OSError:
+                        pass
+
+            if not icon_loaded:
                 self.current_icon_source = self.app_icon_path
                 self.converted_ico_path = self.app_icon_path
+                self._register_session_icon(self.app_icon_path)
                 self._apply_icon_to_button(self.app_icon_path)
 
+            self.btn_import.setToolTip("")
         except Exception as e:
             self.btn_import.setToolTip(f"Failed to import configuration: {e}")
         finally:
             self._importing_config = False
 
+    def import_config(self):
+        open_path, _ = QFileDialog.getOpenFileName(
+            self, "Import Configuration Script", "", "JSON Script (*.json)"
+        )
+        if open_path:
+            self.import_config_from_path(open_path)
+
     def _source_run_file_path(self) -> str:
-        """Resolve a selected run script inside Source Folder for a warning check."""
-        source = os.path.expandvars(self.inp_source.text().strip())
-        run = self._extract_candidate_from_run_text(self.inp_run.text()).strip().strip('"')
-        if not run or not source:
-            return ""
-        run = os.path.expandvars(run)
-        source_dir = source if os.path.isdir(source) else os.path.dirname(source)
-        if os.path.isabs(run) and os.path.isfile(run):
-            return run
-        possible = os.path.join(source_dir, run)
-        if os.path.isfile(possible):
-            return possible
-        # The launcher also supports a bare run filename under nested folders.
-        if os.path.basename(run) == run and os.path.isdir(source_dir):
-            for root, _, names in os.walk(source_dir):
-                if run in names:
-                    return os.path.join(root, run)
-        return ""
+        """Resolve a selected run file inside Source Folder unambiguously."""
+        return _resolve_unique_run_file_in_source(self.inp_source.text(), self.inp_run.text())
+
+    def open_completed_output_folder(self):
+        """Open the output directory (selecting the built EXE on Windows) when 'Completed' is clicked."""
+        target_exe = self.last_output_exe
+        if target_exe and os.path.isfile(target_exe):
+            if os.name == "nt":
+                try:
+                    subprocess.Popen(["explorer.exe", f"/select,{os.path.normpath(target_exe)}"])
+                    return
+                except OSError:
+                    pass
+            open_with_default_viewer(os.path.dirname(target_exe))
+            return
+
+        raw_out = normalize_user_path(self.inp_output.text())
+        if raw_out and os.path.isdir(raw_out):
+            open_with_default_viewer(raw_out)
 
     def start_process(self):
+        # 1. If a build is currently running, allow the user to cancel it
+        if self.worker is not None and self.worker.isRunning():
+            self.btn_start.setEnabled(False)
+            self.btn_start.setText("Canceling...")
+            self.worker.cancel()
+            return
+
+        # 2. If build is in 'Completed' state, open the output folder
+        if self.btn_start.text() == "Completed":
+            self.open_completed_output_folder()
+            return
+
+        # 3. Normalize & validate inputs once before starting a new build
         cfg = self.collect_config()
-        if not cfg["source"].strip():
-            self.btn_start.setToolTip("Please specify a Source Folder or file.")
+        norm_source = normalize_user_path(cfg["source"])
+        norm_output = normalize_user_path(cfg["output"])
+        extract_raw = cfg["extract_to"].strip().strip('"')
+        name_raw = cfg["name"].strip()
+        ver_raw = cfg["version"].strip()
+
+        if not norm_source or not os.path.exists(norm_source) or not is_valid_output_directory_path(norm_output):
+            self.btn_start.setText("Failed")
+            self.btn_start.setToolTip("")
             return
-        if not cfg["output"].strip():
-            self.btn_start.setToolTip("Please specify an Output save directory.")
+
+        # Store normalized source and output so Worker uses the exact same paths
+        cfg["source"] = norm_source
+        cfg["output"] = norm_output
+
+        # Version format check (strict ASCII digits, rejects 'abc123' and '1.²')
+        if not is_valid_version_string(ver_raw):
+            self.btn_start.setText("Failed")
+            self.btn_start.setToolTip("")
             return
-        run_script_path = self._source_run_file_path()
+
+        # Windows reserved device names & illegal characters check (CON, CON.foo.bar, NUL, PRN, LPT1.log.more, etc.)
+        pkg_check_name = name_raw[:-4] if name_raw.lower().endswith(".exe") else name_raw
+        if (is_windows_reserved_name(pkg_check_name)
+                or path_has_reserved_or_invalid_component(extract_raw)):
+            self.btn_start.setText("Failed")
+            self.btn_start.setToolTip("")
+            return
+
+        # Run File existence & unambiguous validity check when not in 'Extract Only' mode
+        run_script_path = ""
+        if not cfg["extract_only"]:
+            run_script_path = self._source_run_file_path()
+            if not cfg["run_file"].strip() or not run_script_path:
+                self.btn_start.setText("Failed")
+                self.btn_start.setToolTip("")
+                return
+
+        # Prevent source-file / run-file vs output-EXE collision
+        safe_base_name = SFXBuilderWorker.sanitize_package_base_name(name_raw)
+        planned_exe = os.path.join(norm_output, f"{safe_base_name}.exe")
+
+        if os.path.isfile(norm_source) and paths_refer_to_same_location(norm_source, planned_exe):
+            if not (cfg["dont_replace"] and os.path.exists(planned_exe)):
+                self.btn_start.setText("Failed")
+                self.btn_start.setToolTip("")
+                return
+
+        if run_script_path and paths_refer_to_same_location(run_script_path, planned_exe):
+            if not (cfg["dont_replace"] and os.path.exists(planned_exe)):
+                self.btn_start.setText("Failed")
+                self.btn_start.setToolTip("")
+                return
+
         cfg["self_elevating_run_file"] = _looks_like_self_elevating_script(run_script_path)
-        self.btn_start.setEnabled(False)
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("Cancel")
+        self.btn_start.setToolTip("")
         self.progress_bar.setValue(0)
 
         self.worker = SFXBuilderWorker(cfg)
         self.worker.progress.connect(self.progress_bar.setValue)
-        self.worker.finished.connect(self.on_process_finished)
+        self.worker.build_finished.connect(self.on_process_finished)
+        self.worker.finished.connect(self.on_worker_thread_finished)
         self.worker.start()
 
-    def on_process_finished(self, success: bool, message: str):
+    def on_process_finished(self, success: bool, _message: str):
+        if self._close_pending:
+            return
+
         self.btn_start.setEnabled(True)
+        self.btn_start.setToolTip("")
+        was_cancelled = self.worker is not None and self.worker._cancelled
+        if was_cancelled:
+            self.progress_bar.setValue(0)
+            self.btn_start.setText("Canceled")
+            return
+
         if success:
+            if self.worker is not None:
+                self.last_output_exe = self.worker.output_exe_path
             self.btn_start.setText("Completed")
-            self.btn_start.setToolTip(message)
         else:
             self.progress_bar.setValue(0)
             self.btn_start.setText("Failed")
-            self.btn_start.setToolTip(message)
+
+    def on_worker_thread_finished(self):
+        """Invoked by QThread.finished after the OS thread has completely exited."""
+        if self._close_pending:
+            self.close()
+
+    def closeEvent(self, event):
+        """Defer window close until QThread.finished fires so the worker never outlives the window."""
+        if self.worker is not None and self.worker.isRunning():
+            self._close_pending = True
+            self.btn_start.setEnabled(False)
+            self.btn_start.setText("Canceling...")
+            self.worker.cancel()
+            event.ignore()
+            return
+
+        for ico_path in list(self._session_temp_icons):
+            if ico_path != self.app_icon_path and os.path.isfile(ico_path) and not _is_file_in_use(ico_path):
+                try:
+                    os.unlink(ico_path)
+                except OSError:
+                    pass
+        self._session_temp_icons.clear()
+        cleanup_stale_temp_files(protected_paths={self.app_icon_path})
+        event.accept()
 
 
 if __name__ == "__main__":
