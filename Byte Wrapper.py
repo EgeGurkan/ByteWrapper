@@ -19,9 +19,7 @@ from xml.sax.saxutils import escape as xml_escape
 # Support #
 # Update Python # py -m pip install --upgrade pip
 # Install Components # py -m pip install PyQt6 Pillow pillow-jxl-plugin pyinstaller
-# Check Components # py -c "from PyQt6.QtWidgets import QApplication; from PIL import Image; import pillow_jxl; print('All dependencies OK')"
 # Compile # py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl "Byte Wrapper.py"
-
 
 # ==============================================================================
 # 1. GLOBAL COMMANDS, CONSTANTS & CORE UTILITIES
