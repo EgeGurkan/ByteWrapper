@@ -79,7 +79,7 @@ _RESERVED_WIN_NAMES_RE = re.compile(
     re.IGNORECASE,
 )
 _INVALID_PATH_CHARS = frozenset('*?"<>|')
-_PCT_RE = re.compile(rb"(\d{1,3})%")
+_PCT_RE = re.compile(rb"(?:^|[\r\n\x08])\s*(\d{1,3})%(?=\s|$)")
 
 _CFG_STR_KEYS = (
     "source", "extract_to", "run_file", "output",
@@ -92,11 +92,14 @@ _CFG_BOOL_KEYS = (
 
 SECRET_EXPORT_KEY = b"ByteWrapper_Config_Cipher_Key"
 _CACHED_TOOL_PATHS: dict[str, str] = {}
+_SINGLE_INSTANCE_MUTEX = None
 
 _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _ENUMRESNAMEPROCW = ctypes.WINFUNCTYPE(
     ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ssize_t
 )
+_KERNEL32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, ctypes.c_wchar_p]
+_KERNEL32.CreateMutexW.restype = wintypes.HANDLE
 _KERNEL32.LoadLibraryExW.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
 _KERNEL32.LoadLibraryExW.restype = ctypes.c_void_p
 _KERNEL32.FreeLibrary.argtypes = [ctypes.c_void_p]
@@ -119,6 +122,25 @@ _SHELL32.PickIconDlg.argtypes = [
     wintypes.HWND, ctypes.c_wchar_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_int)
 ]
 _SHELL32.PickIconDlg.restype = ctypes.c_int
+
+
+def _acquire_single_instance_lock() -> bool:
+    """Ensure only a single instance of Byte Wrapper runs at a time."""
+    global _SINGLE_INSTANCE_MUTEX
+    _SINGLE_INSTANCE_MUTEX = _KERNEL32.CreateMutexW(
+        None, False, "Local\\ByteWrapper_SFXConstructor_SingleInstance"
+    )
+    if not _SINGLE_INSTANCE_MUTEX or ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        try:
+            existing_hwnd = ctypes.windll.user32.FindWindowW(None, "Byte Wrapper")
+            if existing_hwnd:
+                if ctypes.windll.user32.IsIconic(existing_hwnd):
+                    ctypes.windll.user32.ShowWindow(existing_hwnd, 9)  # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(existing_hwnd)
+        except Exception:
+            pass
+        return False
+    return True
 
 
 def expand_path(raw_path: str, resolve_abs: bool = False) -> str:
@@ -154,15 +176,10 @@ def _validate_package_name(raw_name: str) -> str | None:
     return name
 
 
-def _derive_auto_name(stem: str) -> str:
-    cleaned = (stem or "").strip()
-    return cleaned if (cleaned and _validate_package_name(cleaned) is not None) else ""
-
-
 def _derive_auto_name_from_path(path_str: str, strip_ext: bool = True) -> str:
     base = os.path.basename(path_str.replace("/", "\\"))
-    stem = os.path.splitext(base)[0] if strip_ext else base
-    return _derive_auto_name(stem)
+    stem = (os.path.splitext(base)[0] if strip_ext else base).strip()
+    return (_validate_package_name(stem) or "") if stem else ""
 
 
 def _relpath_if_within(path: str, directory: str) -> str:
@@ -179,37 +196,6 @@ def _relpath_if_within(path: str, directory: str) -> str:
     except (OSError, ValueError):
         pass
     return ""
-
-
-def _output_conflicts_with_source(source_path: str, output_path: str, resolved: bool = False) -> bool:
-    source = source_path if resolved else expand_path(source_path, resolve_abs=True)
-    output = output_path if resolved else expand_path(output_path, resolve_abs=True)
-    if not source or not output or not os.path.isdir(source):
-        return False
-    return bool(_relpath_if_within(output, source))
-
-
-def _single_file_conflicts_with_output(
-    source_path: str, output_path: str, package_name: str, resolved: bool = False
-) -> bool:
-    """Return True when source is a single file, output is its parent folder, and package name matches."""
-    source = source_path if resolved else expand_path(source_path, resolve_abs=True)
-    output = output_path if resolved else expand_path(output_path, resolve_abs=True)
-    if not source or not output:
-        return False
-    try:
-        src_stem = os.path.splitext(os.path.basename(source))[0]
-        src_base = _validate_package_name(src_stem)
-        pkg_base = _validate_package_name(package_name)
-        if not src_base or not pkg_base or os.path.normcase(src_base) != os.path.normcase(pkg_base):
-            return False
-        if not os.path.isfile(source):
-            return False
-        src_dir = os.path.normcase(os.path.realpath(os.path.dirname(source)))
-        out_dir = os.path.normcase(os.path.realpath(output))
-        return src_dir == out_dir
-    except (OSError, ValueError):
-        return False
 
 
 def _has_matching_url(event, allowed_exts: tuple[str, ...] = ()) -> bool:
@@ -255,6 +241,30 @@ def _parse_pe_version(raw_ver: str) -> tuple[str, str] | None:
     while len(normalized) < 4:
         normalized.append("0")
     return ".".join(normalized), cleaned
+
+
+def _validate_metadata_fields(
+    raw_name: str, raw_desc: str, raw_ver: str
+) -> tuple[str, str, tuple[str, str]]:
+    """Validate package name, description, and version in a single place."""
+    base_name = _validate_package_name(raw_name)
+    if base_name is None:
+        raise ValueError(
+            "Package name contains invalid characters or is a reserved Windows file name."
+        )
+    desc_clean = (raw_desc or "").strip()
+    if _INVALID_FILENAME_CHARS_RE.search(desc_clean):
+        raise ValueError("Description contains invalid characters.")
+    parsed_ver = _parse_pe_version(raw_ver)
+    if parsed_ver is None:
+        raise ValueError("Version must be 1 to 4 numbers (0-65534) separated by dots.")
+    return base_name, desc_clean, parsed_ver
+
+
+def _validate_password_input(pw: str) -> str:
+    if pw and not pw.strip():
+        raise ValueError("Password cannot contain only whitespace.")
+    return pw
 
 
 def _remove_path_4_steps(path: str, is_dir: bool = False):
@@ -372,10 +382,11 @@ def decrypt_password_from_import(cipher_text: str) -> str:
             raw_bytes = base64.urlsafe_b64decode(payload.encode("ascii"))
             if base64.urlsafe_b64encode(raw_bytes).decode("ascii") != payload:
                 raise ValueError("Invalid base64 password payload.")
-            return _xor_cipher(raw_bytes).decode("utf-8")
+            plain = _xor_cipher(raw_bytes).decode("utf-8")
         except Exception as exc:
             raise ValueError("Corrupted encrypted password data.") from exc
-    return cipher_text
+        return _validate_password_input(plain)
+    return _validate_password_input(cipher_text)
 
 
 def _split_command_and_args(raw: str) -> tuple[str, str]:
@@ -395,39 +406,56 @@ def _split_command_and_args(raw: str) -> tuple[str, str]:
     return (parts[0], "") if len(parts) == 1 else (parts[0], parts[1].strip())
 
 
-def _locate_run_file_in_source(source_path: str, cmd_part: str, source_resolved: bool = False) -> str:
+def _resolve_run_file(
+    source_path: str,
+    cmd_part: str,
+    source_resolved: bool = False,
+    source_kind: str = "",
+) -> tuple[str, str]:
+    """Locate run file in source and compute its package-relative target in a single pass."""
     src = source_path if source_resolved else expand_path(source_path, resolve_abs=True)
     if not src:
-        return ""
+        return "", cmd_part.replace("/", "\\")
+
+    if not source_kind:
+        if os.path.isdir(src):
+            source_kind = "dir"
+        elif os.path.isfile(src):
+            source_kind = "file"
+
+    resolved_run_path = ""
+    cand = expand_path(cmd_part) if cmd_part else ""
+    cand_is_abs = os.path.isabs(cand) if cand else False
+
     if not cmd_part:
-        return src if os.path.isfile(src) else ""
-    cand = expand_path(cmd_part)
-    if os.path.isabs(cand) and os.path.isfile(cand):
-        return os.path.abspath(cand)
-    if os.path.isdir(src):
+        if source_kind == "file":
+            resolved_run_path = src
+    elif cand_is_abs and os.path.isfile(cand):
+        resolved_run_path = os.path.abspath(cand)
+    elif source_kind == "dir":
         direct = os.path.join(src, cand.lstrip("\\/"))
         if os.path.isfile(direct):
-            return os.path.abspath(direct)
-    elif os.path.isfile(src) and os.path.normcase(cand) == os.path.normcase(os.path.basename(src)):
-        return src
-    return ""
+            resolved_run_path = os.path.abspath(direct)
+    elif source_kind == "file" and os.path.normcase(cand) == os.path.normcase(os.path.basename(src)):
+        resolved_run_path = src
 
-
-def _package_run_target(source_path: str, cmd_part: str, resolved_run_path: str) -> str:
-    """Only rewrite files actually included in the package to relative paths."""
     target = cmd_part
     if resolved_run_path:
-        if os.path.isfile(source_path) and _relpath_if_within(resolved_run_path, source_path):
-            target = os.path.basename(source_path)
-        elif os.path.isdir(source_path):
-            rel = _relpath_if_within(resolved_run_path, source_path)
+        if source_kind == "file":
+            if resolved_run_path == src or _relpath_if_within(resolved_run_path, src):
+                target = os.path.basename(src)
+            elif not cand_is_abs:
+                target = resolved_run_path
+        elif source_kind == "dir":
+            rel = _relpath_if_within(resolved_run_path, src)
             if rel and rel != ".":
                 target = rel
-            elif not os.path.isabs(expand_path(cmd_part)):
+            elif not cand_is_abs:
                 target = resolved_run_path
-        elif not os.path.isabs(expand_path(cmd_part)):
+        elif not cand_is_abs:
             target = resolved_run_path
-    return target.replace("/", "\\")
+
+    return resolved_run_path, target.replace("/", "\\")
 
 
 def _looks_like_self_elevating_script(path: str) -> bool:
@@ -463,7 +491,11 @@ def _to_square_rgba(img: Image.Image) -> Image.Image:
 def build_multi_ico_bytes(master_img: Image.Image) -> bytes:
     """Convert a PIL image into multi-resolution Windows .ico bytes in memory."""
     try:
-        src = _to_square_rgba(master_img)
+        src = (
+            master_img
+            if (master_img.mode == "RGBA" and master_img.width == master_img.height)
+            else _to_square_rgba(master_img)
+        )
         buf = io.BytesIO()
         src.save(
             buf,
@@ -561,7 +593,11 @@ def load_pil_from_ico_bytes(data: bytes) -> Image.Image | None:
 
 def pil_to_qpixmap(pil_img: Image.Image, logical_size: int, dpr: float = 1.0) -> QPixmap:
     target_px = max(1, round(logical_size * dpr))
-    img = _to_square_rgba(pil_img)
+    img = (
+        pil_img
+        if (pil_img.mode == "RGBA" and pil_img.width == pil_img.height)
+        else _to_square_rgba(pil_img)
+    )
     if img.size != (target_px, target_px):
         img = img.resize((target_px, target_px), Image.Resampling.LANCZOS)
     raw_bgra = img.tobytes("raw", "BGRA")
@@ -840,9 +876,9 @@ class SFXBuilderWorker(QThread):
             "csc",
         )
 
-    def _get_source_total_size(self, source_path: str) -> int:
+    def _get_source_total_size(self, source_path: str, is_dir: bool) -> int:
         """Scan source size up to DICT_SCAN_CAP_BYTES (65 MB) in a single scandir pass."""
-        if os.path.isfile(source_path):
+        if not is_dir:
             try:
                 return os.path.getsize(source_path)
             except OSError:
@@ -909,10 +945,11 @@ class SFXBuilderWorker(QThread):
         raise RuntimeError("Failed to commit output executable.")
 
     def build_7z_archive(self, seven_zip: str, source_path: str, archive_path: str) -> int:
-        cmd = [seven_zip, "a", "-bsp1"]
+        is_dir = self.cfg["source_kind"] == "dir"
+        cmd = [seven_zip, "a", "-bso0", "-bsp1"]
 
         if self.cfg["compress"]:
-            dict_flag = self._select_7z_dict_flag(self._get_source_total_size(source_path))
+            dict_flag = self._select_7z_dict_flag(self._get_source_total_size(source_path, is_dir))
             cmd.extend(["-t7z", "-mx=9", "-m0=lzma2", dict_flag, "-mfb=64", "-ms=16g", "-mmt=on"])
         else:
             cmd.extend(["-t7z", "-mx=0", "-mmt=on"])
@@ -921,7 +958,7 @@ class SFXBuilderWorker(QThread):
             cmd.extend([f"-p{self._archive_7z_pw}", "-mhe=on"])
 
         cmd.extend(["-y", archive_path, "--"])
-        cmd.append(os.path.join(source_path, "*") if os.path.isdir(source_path) else source_path)
+        cmd.append(os.path.join(source_path, "*") if is_dir else source_path)
 
         proc = self._start_process(
             cmd,
@@ -964,15 +1001,20 @@ class SFXBuilderWorker(QThread):
         cmd_part = self.cfg["cmd_part"]
         run_args_raw = self.cfg["run_args"]
 
-        resolved_run_path = (
-            "" if self.cfg["extract_only"]
-            else _locate_run_file_in_source(source_path, cmd_part, source_resolved=True)
-        )
+        if self.cfg["extract_only"]:
+            resolved_run_path, run_target_rel = "", ""
+        else:
+            resolved_run_path, run_target_rel = _resolve_run_file(
+                source_path,
+                cmd_part,
+                source_resolved=True,
+                source_kind=self.cfg["source_kind"],
+            )
+
         self_elevating = (
             _looks_like_self_elevating_script(resolved_run_path)
             if (self.cfg["hidden_run"] and not self.cfg["run_as_admin"]) else False
         )
-        run_target_rel = _package_run_target(source_path, cmd_part, resolved_run_path)
 
         def cs_escape(s: str) -> str:
             return (
@@ -1179,7 +1221,7 @@ namespace ByteWrapperStub
                 try
                 {{
                     ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath, ELEVATED_ARG_FLAG);
-                    psi.WorkingDirectory = Path.GetTempPath();
+                    psi.WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory;
                     psi.UseShellExecute = true;
                     psi.Verb = "runas";
                     psi.WindowStyle = ProcessWindowStyle.Hidden;
@@ -1267,7 +1309,7 @@ namespace ByteWrapperStub
                         if (outSwitch.Length == 2 && outSwitch[1] == ':')
                             outSwitch += "\\";
                         StringBuilder args = new StringBuilder();
-                        args.Append(trackProgress ? "x -t7z -bsp1 " : "x -t7z ");
+                        args.Append(trackProgress ? "x -t7z -bso0 -bsp1 " : "x -t7z ");
                         args.Append(QuoteCmdValue(archivePath)).Append(" -o").Append(QuoteCmdValue(outSwitch)).Append(' ');
                         if (!string.IsNullOrEmpty(runtime7zPw))
                         {{
@@ -1294,18 +1336,23 @@ namespace ByteWrapperStub
                                 {{
                                     for (int i = charsRead - 1; i >= 1; i--)
                                     {{
-                                        if (readBuf[i] == '%')
+                                        if (readBuf[i] == '%' && (i + 1 == charsRead || char.IsWhiteSpace(readBuf[i + 1])))
                                         {{
                                             int d = i - 1;
                                             while (d >= 0 && readBuf[d] >= '0' && readBuf[d] <= '9') d--;
                                             int digits = i - 1 - d;
                                             if (digits >= 1 && digits <= 3)
                                             {{
-                                                int pct = 0;
-                                                for (int k = d + 1; k < i; k++)
-                                                    pct = pct * 10 + (readBuf[k] - '0');
-                                                reportProgress(Math.Min(100, pct));
-                                                break;
+                                                int s = d;
+                                                while (s >= 0 && readBuf[s] == ' ') s--;
+                                                if (s < 0 || readBuf[s] == '\r' || readBuf[s] == '\n' || readBuf[s] == '\b')
+                                                {{
+                                                    int pct = 0;
+                                                    for (int k = d + 1; k < i; k++)
+                                                        pct = pct * 10 + (readBuf[k] - '0');
+                                                    reportProgress(Math.Min(100, pct));
+                                                    break;
+                                                }}
                                             }}
                                         }}
                                     }}
@@ -1331,6 +1378,13 @@ namespace ByteWrapperStub
                     Label lblControl;
                     using (Form progressForm = CreateProgressForm(out pbControl, out lblControl))
                     {{
+                        bool allowClose = false;
+                        progressForm.FormClosing += delegate(object sender, FormClosingEventArgs e)
+                        {{
+                            if (!allowClose && e.CloseReason == CloseReason.UserClosing)
+                                e.Cancel = true;
+                        }};
+
                         int lastUiPct = -1;
                         Action<int> uiReporter = delegate(int val)
                         {{
@@ -1363,7 +1417,9 @@ namespace ByteWrapperStub
                                 if (progressForm.IsHandleCreated && !progressForm.IsDisposed)
                                     progressForm.BeginInvoke((MethodInvoker)delegate
                                     {{
-                                        pbControl.Value = 100;
+                                        allowClose = true;
+                                        if (!pbControl.IsDisposed)
+                                            pbControl.Value = 100;
                                         progressForm.Close();
                                     }});
                             }}
@@ -1372,6 +1428,8 @@ namespace ByteWrapperStub
                         worker.IsBackground = true;
                         progressForm.Shown += delegate {{ worker.Start(); }};
                         progressForm.ShowDialog();
+                        if (worker.IsAlive)
+                            worker.Join();
                     }}
                 }}
                 else
@@ -1890,7 +1948,7 @@ class SmartLineEdit(QLineEdit):
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
         if event.button() == Qt.MouseButton.LeftButton and not self.text().strip():
-            self.open_selector()
+            QTimer.singleShot(0, self.open_selector)
 
     def contextMenuEvent(self, event):
         self.open_selector()
@@ -1898,11 +1956,14 @@ class SmartLineEdit(QLineEdit):
     def _format_run_file_selection(self, file_path: str) -> str:
         norm_file = expand_path(file_path, resolve_abs=True)
         if self.parent_win:
-            src = expand_path(self.parent_win.inp_source.text(), resolve_abs=True)
-            if os.path.isdir(src):
+            src = self.parent_win._resolved_source
+            src_kind = self.parent_win._source_kind
+            if src_kind == "dir":
                 rel = _relpath_if_within(norm_file, src)
                 if rel and rel != ".":
                     return rel
+            elif src_kind == "file" and (norm_file == src or _relpath_if_within(norm_file, src) == "."):
+                return os.path.basename(norm_file)
         return norm_file
 
     def _set_selected_path(self, value: str):
@@ -1952,8 +2013,9 @@ class SmartLineEdit(QLineEdit):
         elif action == act_file:
             start_dir = ""
             if self.mode == "run_file" and self.parent_win:
-                src = expand_path(self.parent_win.inp_source.text())
-                start_dir = src if os.path.isdir(src) else (os.path.dirname(src) if os.path.isfile(src) else "")
+                src = self.parent_win._resolved_source
+                src_kind = self.parent_win._source_kind
+                start_dir = src if src_kind == "dir" else (os.path.dirname(src) if src_kind == "file" else "")
             file_path, _ = QFileDialog.getOpenFileName(self, "Select File", start_dir)
             if file_path:
                 self._set_selected_path(
@@ -1985,7 +2047,19 @@ class SmartLineEdit(QLineEdit):
                     and dropped_path.lower().endswith(".json")
                     and os.path.isfile(dropped_path)):
                 self.parent_win.import_config_from_path(dropped_path)
-            elif self.mode == "run_file":
+                event.acceptProposedAction()
+                return
+            if self.mode in ("extract_to", "output") and os.path.isfile(dropped_path):
+                if self.parent_win is not None:
+                    self.parent_win._fail_start("Please drop a folder, not a file, into this field.")
+                event.ignore()
+                return
+            if self.mode == "run_file" and os.path.isdir(dropped_path):
+                if self.parent_win is not None:
+                    self.parent_win._fail_start("Run File must be an executable or script file, not a folder.")
+                event.ignore()
+                return
+            if self.mode == "run_file":
                 self._set_selected_path(self._format_run_file_selection(dropped_path))
             else:
                 self._set_selected_path(dropped_path)
@@ -2022,6 +2096,12 @@ class ByteWrapperWindow(QWidget):
         self._user_edited_name = False
         self._user_dont_replace = False
         self._tracked_source_path = ""
+        self._resolved_source = ""
+        self._source_kind = ""
+        self._source_real = ""
+        self._source_parent_real = ""
+        self._source_exe_base = ""
+        self._output_file_conflict = False
         self._last_run_cand = ""
         self._updating_ui = False
         self._status_dirty = False
@@ -2090,14 +2170,20 @@ class ByteWrapperWindow(QWidget):
         header_layout.addWidget(btn_close, alignment=Qt.AlignmentFlag.AlignTop)
         main_layout.addLayout(header_layout)
 
+        win_path_validator = QRegularExpressionValidator(
+            QRegularExpression(r'^[^*?"<>|\x00-\x1f]*$'), self
+        )
+
         # --- GROUP 1: PATH INPUT FIELDS ---
         main_layout.addWidget(self._make_section_label("Source Folder"))
         self.inp_source = SmartLineEdit("Select or drag and drop file or folder...", mode="source", parent_win=self)
+        self.inp_source.setValidator(win_path_validator)
         self.inp_source.textChanged.connect(self.on_source_path_changed)
         main_layout.addWidget(self.inp_source)
 
         main_layout.addWidget(self._make_section_label("Extract To"))
         self.inp_extract = SmartLineEdit("Define extraction path...", mode="extract_to", parent_win=self)
+        self.inp_extract.setValidator(win_path_validator)
         main_layout.addWidget(self.inp_extract)
 
         main_layout.addWidget(self._make_section_label("Run File"))
@@ -2107,6 +2193,7 @@ class ByteWrapperWindow(QWidget):
 
         main_layout.addWidget(self._make_section_label("Output"))
         self.inp_output = SmartLineEdit("Define save path...", mode="output", parent_win=self)
+        self.inp_output.setValidator(win_path_validator)
         self.inp_output.textChanged.connect(self._sync_dont_replace_state)
         self.inp_output.editingFinished.connect(lambda: self.validate_output_path(sync_replace=False))
         main_layout.addWidget(self.inp_output)
@@ -2481,17 +2568,50 @@ class ByteWrapperWindow(QWidget):
     # --------------------------------------------------------------------------
     # 4.3. GROUP 1 HANDLERS: SOURCE FOLDER, EXTRACT TO, RUN FILE, OUTPUT
     # --------------------------------------------------------------------------
+    def _update_source_cache(self, raw_text: str) -> str:
+        expanded = expand_path(raw_text, resolve_abs=True) if raw_text.strip() else ""
+        self._resolved_source = expanded
+        self._source_kind = ""
+        self._source_real = ""
+        self._source_parent_real = ""
+        self._source_exe_base = ""
+        if expanded:
+            if os.path.isdir(expanded):
+                self._source_kind = "dir"
+                try:
+                    self._source_real = os.path.realpath(expanded)
+                except OSError:
+                    self._source_real = expanded
+            elif os.path.isfile(expanded):
+                self._source_kind = "file"
+                try:
+                    real_file = os.path.realpath(expanded)
+                except OSError:
+                    real_file = expanded
+                self._source_real = real_file
+                self._source_parent_real = os.path.normcase(os.path.dirname(real_file))
+                stem, ext = os.path.splitext(os.path.basename(expanded))
+                if ext.lower() == ".exe":
+                    self._source_exe_base = os.path.normcase(_validate_package_name(stem) or "")
+        return expanded
+
     def _sync_dont_replace_state(
-        self, *_args, norm_source: str = "", norm_output: str = "", resolved: bool = False
+        self, *_args, norm_output: str = "", output_resolved: bool = False
     ):
         if self._updating_ui:
             return
-        conflict = _single_file_conflicts_with_output(
-            norm_source if resolved else self.inp_source.text(),
-            norm_output if resolved else self.inp_output.text(),
-            self.inp_name.text(),
-            resolved=resolved,
-        )
+        conflict = False
+        if self._source_kind == "file" and self._source_exe_base:
+            pkg_base = _validate_package_name(self.inp_name.text())
+            if pkg_base and os.path.normcase(pkg_base) == self._source_exe_base:
+                out_dir = norm_output if output_resolved else expand_path(self.inp_output.text(), resolve_abs=True)
+                if out_dir:
+                    try:
+                        conflict = os.path.normcase(os.path.realpath(out_dir)) == self._source_parent_real
+                    except OSError:
+                        conflict = False
+
+        self._output_file_conflict = conflict
         target_checked = True if conflict else self._user_dont_replace
         if self.chk_dont_replace.isChecked() != target_checked:
             self._updating_ui = True
@@ -2505,31 +2625,31 @@ class ByteWrapperWindow(QWidget):
         )
 
     def validate_output_path(
-        self, sync_replace: bool = True, norm_source: str = "", norm_output: str = "", resolved: bool = False
+        self, sync_replace: bool = True, norm_output: str = "", output_resolved: bool = False
     ) -> bool:
         if self._updating_ui:
             return True
-        src = norm_source if resolved else expand_path(self.inp_source.text(), resolve_abs=True)
-        out = norm_output if resolved else expand_path(self.inp_output.text(), resolve_abs=True)
-        if _output_conflicts_with_source(src, out, resolved=True):
+        out = norm_output if output_resolved else expand_path(self.inp_output.text(), resolve_abs=True)
+        if self._source_kind == "dir" and self._source_real and out and bool(_relpath_if_within(out, self._source_real)):
             self._updating_ui = True
             try:
                 self.inp_output.clear()
             finally:
                 self._updating_ui = False
-            self.inp_output.setToolTip("Output cannot be the source folder or one of its subfolders.")
-            self._sync_dont_replace_state(norm_source=src, norm_output="", resolved=True)
+            msg = "Output cannot be the source folder or one of its subfolders."
+            self.inp_output.setToolTip(msg)
+            self._sync_dont_replace_state(norm_output="", output_resolved=True)
+            self._fail_start(msg)
             return False
         self.inp_output.setToolTip("")
         if sync_replace:
-            self._sync_dont_replace_state(norm_source=src, norm_output=out, resolved=True)
+            self._sync_dont_replace_state(norm_output=out, output_resolved=True)
         return True
 
     def _auto_fill_name_from_source_dir(self):
         if not self._user_edited_name and not self.inp_name.text().strip():
-            target = expand_path(self.inp_source.text())
-            if target and os.path.isdir(target):
-                folder_stem = _derive_auto_name_from_path(target, strip_ext=False)
+            if self._source_kind == "dir" and self._resolved_source:
+                folder_stem = _derive_auto_name_from_path(self._resolved_source, strip_ext=False)
                 if folder_stem:
                     self._updating_ui = True
                     self.inp_name.setText(folder_stem)
@@ -2545,12 +2665,13 @@ class ByteWrapperWindow(QWidget):
         if normalized == self._tracked_source_path:
             return
         self._tracked_source_path = normalized
+        self._update_source_cache(raw_text)
         self._user_edited_name = False
         self._last_run_cand = ""
 
         self._updating_ui = True
         try:
-            if expanded and os.path.isfile(expanded):
+            if self._source_kind == "file":
                 base = os.path.basename(expanded)
                 _, ext = os.path.splitext(base)
                 self.inp_name.setText(_derive_auto_name_from_path(base, strip_ext=True))
@@ -2568,7 +2689,7 @@ class ByteWrapperWindow(QWidget):
                     self.inp_run.clear()
                 folder_stem = (
                     _derive_auto_name_from_path(expanded, strip_ext=False)
-                    if (self.chk_extract_only.isChecked() and expanded and os.path.isdir(expanded))
+                    if (self.chk_extract_only.isChecked() and self._source_kind == "dir")
                     else ""
                 )
                 if self.inp_name.text() != folder_stem:
@@ -2577,9 +2698,8 @@ class ByteWrapperWindow(QWidget):
         finally:
             self._updating_ui = False
             self.validate_output_path(
-                norm_source=expanded,
                 norm_output=expand_path(self.inp_output.text(), resolve_abs=True),
-                resolved=True,
+                output_resolved=True,
             )
 
     def on_run_file_changed(self, text: str):
@@ -2617,17 +2737,18 @@ class ByteWrapperWindow(QWidget):
             dpr = max(1.0, self.devicePixelRatioF())
             self.btn_icon.setIcon(QIcon(pil_to_qpixmap(pil_img, 24, dpr)))
 
-    def reset_icon_to_default(self, _pos=None):
+    def reset_icon_to_default(self, _pos=None, keep_tooltip: bool = False):
         had_custom = bool(self.current_icon_source or self.current_icon_bytes)
         self.current_icon_source = ""
         self.current_icon_bytes = b""
         if had_custom:
             self.btn_icon.setIcon(self.default_btn_icon)
-        self.btn_icon.setToolTip(
-            'Default Byte Wrapper icon restored. Left-click or drop file to select another.'
-            if had_custom else
-            'Left-click or drop file: set icon. Right-click: restore default icon.'
-        )
+        if not keep_tooltip:
+            self.btn_icon.setToolTip(
+                'Default Byte Wrapper icon restored. Left-click or drop file to select another.'
+                if had_custom else
+                'Left-click or drop file: set icon. Right-click: restore default icon.'
+            )
         self.reset_start_status()
 
     def open_icon_menu(self):
@@ -2652,11 +2773,14 @@ class ByteWrapperWindow(QWidget):
         if not resolved_path:
             self.btn_icon.setToolTip("Could not extract or convert the selected icon.")
             return False
+        target_source = f"{resolved_path},{resolved_idx}" if resolved_idx is not None else resolved_path
+        if target_source == self.current_icon_source and self.current_icon_bytes:
+            return True
         ico_bytes, pil_img = extract_icon_from_file(resolved_path, resolved_idx)
         if not ico_bytes or pil_img is None:
             self.btn_icon.setToolTip("Could not extract or convert the selected icon.")
             return False
-        self.current_icon_source = f"{resolved_path},{resolved_idx}" if resolved_idx is not None else resolved_path
+        self.current_icon_source = target_source
         self.current_icon_bytes = ico_bytes
         self._set_button_icon_pil(pil_img)
         label = (
@@ -2679,7 +2803,12 @@ class ByteWrapperWindow(QWidget):
 
     def set_icon_from_run_file(self):
         cmd_part, _ = _split_command_and_args(self.inp_run.text())
-        target_file = _locate_run_file_in_source(self.inp_source.text(), cmd_part)
+        target_file, _ = _resolve_run_file(
+            self._resolved_source,
+            cmd_part,
+            source_resolved=True,
+            source_kind=self._source_kind,
+        )
         if not target_file:
             self.btn_icon.setToolTip("Could not locate an icon from Run File or Source Folder.")
             return
@@ -2704,9 +2833,7 @@ class ByteWrapperWindow(QWidget):
     def on_dont_replace_toggled(self, checked: bool):
         if self._updating_ui:
             return
-        if _single_file_conflicts_with_output(
-            self.inp_source.text(), self.inp_output.text(), self.inp_name.text()
-        ):
+        if self._output_file_conflict:
             if not checked:
                 self._updating_ui = True
                 try:
@@ -2765,9 +2892,7 @@ class ByteWrapperWindow(QWidget):
     # 4.6. GROUP 4 HANDLERS: EXPORT, IMPORT, PASSWORD & START PROCESS
     # --------------------------------------------------------------------------
     def collect_config(self, include_icon_bytes: bool = True) -> dict:
-        pw = self.inp_password.text()
-        if not pw.strip():
-            pw = ""
+        pw = _validate_password_input(self.inp_password.text())
         cfg = {
             "source": self.inp_source.text(),
             "extract_to": self.inp_extract.text(),
@@ -2793,7 +2918,17 @@ class ByteWrapperWindow(QWidget):
         return cfg
 
     def export_config(self):
-        export_data = self.collect_config(include_icon_bytes=False)
+        try:
+            export_data = self.collect_config(include_icon_bytes=False)
+            _validate_metadata_fields(
+                export_data["name"], export_data["description"], export_data["version"]
+            )
+        except ValueError as e:
+            err_msg = str(e)
+            self.btn_export.setToolTip(err_msg)
+            self._fail_start(err_msg)
+            return
+
         export_data["password"] = encrypt_password_for_export(export_data["password"])
 
         save_path, _ = QFileDialog.getSaveFileName(
@@ -2851,18 +2986,18 @@ class ByteWrapperWindow(QWidget):
                     raise ValueError(f"Invalid type for '{key}': expected boolean.")
                 bool_vals[key] = val
 
+            if bool_vals["extract_only"] and bool_vals["hidden_run"]:
+                raise ValueError("Cannot enable both 'extract_only' and 'hidden_run' in configuration.")
+
+            for path_key in ("source", "extract_to", "output"):
+                raw_p = str_vals[path_key].strip()
+                if raw_p and _has_invalid_path_chars(expand_path(raw_p)):
+                    raise ValueError(f"Invalid path characters in '{path_key}'.")
+
             ver_val = str_vals["version"].strip()
-            if _parse_pe_version(ver_val) is None:
-                raise ValueError("Version must be 1 to 4 numbers (0-65534) separated by dots.")
-
             name_val = str_vals["name"]
-            if name_val and _validate_package_name(name_val) is None:
-                raise ValueError("Package name contains invalid characters or is a reserved Windows file name.")
-
             desc_val = str_vals["description"]
-            if _INVALID_FILENAME_CHARS_RE.search(desc_val):
-                raise ValueError("Description contains invalid characters.")
-
+            _, desc_val, _ = _validate_metadata_fields(name_val, desc_val, ver_val)
             pw_val = decrypt_password_from_import(str_vals["password"])
         except Exception as e:
             err_msg = f"Failed to import configuration: {e}"
@@ -2871,13 +3006,12 @@ class ByteWrapperWindow(QWidget):
             return
 
         self._updating_ui = True
-        expanded_src = ""
         try:
             run_val = str_vals["run_file"]
             src_val = str_vals["source"]
             extract_only = bool_vals["extract_only"]
             self._user_edited_name = bool(name_val.strip())
-            expanded_src = expand_path(src_val, resolve_abs=True) if src_val.strip() else ""
+            expanded_src = self._update_source_cache(src_val)
             self._tracked_source_path = os.path.normcase(expanded_src) if expanded_src else ""
 
             cand, _ = _split_command_and_args(run_val)
@@ -2885,9 +3019,9 @@ class ByteWrapperWindow(QWidget):
             if not name_val.strip():
                 if cand:
                     name_val = _derive_auto_name_from_path(cand, strip_ext=True)
-                elif expanded_src and os.path.isfile(expanded_src):
+                elif self._source_kind == "file":
                     name_val = _derive_auto_name_from_path(expanded_src, strip_ext=True)
-                elif extract_only and expanded_src and os.path.isdir(expanded_src):
+                elif extract_only and self._source_kind == "dir":
                     name_val = _derive_auto_name_from_path(expanded_src, strip_ext=False)
 
             self.inp_source.setText(src_val)
@@ -2898,12 +3032,11 @@ class ByteWrapperWindow(QWidget):
             self.inp_desc.setText(desc_val)
             self.inp_version.setText(ver_val)
 
-            hidden_run = False if extract_only else bool_vals["hidden_run"]
             dont_replace_val = bool_vals["dont_replace"]
             self._user_dont_replace = dont_replace_val
 
             self.chk_admin.setChecked(bool_vals["run_as_admin"])
-            self.chk_hidden.setChecked(hidden_run)
+            self.chk_hidden.setChecked(bool_vals["hidden_run"])
             self.chk_dont_replace.setChecked(dont_replace_val)
             self.chk_extract_only.setChecked(extract_only)
             self.chk_self_remove.setChecked(bool_vals["self_remove"])
@@ -2917,16 +3050,17 @@ class ByteWrapperWindow(QWidget):
             self.inp_password.setText(pw_val)
 
             raw_icon_src = str_vals["icon_source"].strip()
-            if not (raw_icon_src and self.apply_custom_icon_file(raw_icon_src)):
+            if not raw_icon_src:
                 self.reset_icon_to_default()
+            elif not self.apply_custom_icon_file(raw_icon_src):
+                self.reset_icon_to_default(keep_tooltip=True)
 
             self.btn_import.setToolTip("")
         finally:
             self._updating_ui = False
             self.validate_output_path(
-                norm_source=expanded_src,
                 norm_output=expand_path(self.inp_output.text(), resolve_abs=True),
-                resolved=True,
+                output_resolved=True,
             )
             self.reset_start_status()
 
@@ -2978,23 +3112,20 @@ class ByteWrapperWindow(QWidget):
             self.open_completed_output_folder()
             return
 
+        self._status_reset_timer.stop()
+        self._status_dirty = False
+
         raw_source = self.inp_source.text().strip()
         raw_extract = self.inp_extract.text().strip()
         raw_run = self.inp_run.text().strip()
         raw_output = self.inp_output.text().strip()
 
-        if not (raw_source or raw_extract or raw_run or raw_output):
-            return
-
-        self._status_reset_timer.stop()
-        self._status_dirty = False
-
-        norm_source = expand_path(raw_source, resolve_abs=True)
+        norm_source = self._update_source_cache(raw_source)
         if not norm_source or _has_invalid_path_chars(norm_source):
             self._fail_start("Source folder or file path is invalid.")
             return
 
-        if not os.path.exists(norm_source):
+        if not self._source_kind:
             self._fail_start("Source folder or file does not exist.")
             return
 
@@ -3024,24 +3155,17 @@ class ByteWrapperWindow(QWidget):
             return
 
         if not self.validate_output_path(
-            sync_replace=False, norm_source=norm_source, norm_output=norm_output, resolved=True
+            sync_replace=True, norm_output=norm_output, output_resolved=True
         ):
-            self._fail_start("Output cannot be the source folder or one of its subfolders.")
             return
 
-        base_name = _validate_package_name(self.inp_name.text())
-        if base_name is None:
-            self._fail_start("Package name contains invalid characters or is a reserved Windows file name.")
-            return
-
-        raw_desc = self.inp_desc.text().strip()
-        if _INVALID_FILENAME_CHARS_RE.search(raw_desc):
-            self._fail_start("Description contains invalid characters.")
-            return
-
-        parsed_ver = _parse_pe_version(self.inp_version.text())
-        if parsed_ver is None:
-            self._fail_start("Version must be 1 to 4 numbers (0-65534) separated by dots.")
+        try:
+            base_name, raw_desc, parsed_ver = _validate_metadata_fields(
+                self.inp_name.text(), self.inp_desc.text(), self.inp_version.text()
+            )
+            cfg = self.collect_config()
+        except ValueError as e:
+            self._fail_start(str(e))
             return
 
         seven_zip = SFXBuilderWorker.find_7zip()
@@ -3054,8 +3178,8 @@ class ByteWrapperWindow(QWidget):
             self._fail_start("Windows .NET C# compiler (csc.exe) was not found!")
             return
 
-        cfg = self.collect_config()
         cfg["source"] = norm_source
+        cfg["source_kind"] = self._source_kind
         cfg["output"] = norm_output
         cfg["extract_to"] = extract_clean
         cfg["description"] = raw_desc
@@ -3111,6 +3235,8 @@ class ByteWrapperWindow(QWidget):
 
 
 if __name__ == "__main__":
+    if not _acquire_single_instance_lock():
+        sys.exit(0)
     app = QApplication(sys.argv)
     win = ByteWrapperWindow()
     win.show()
