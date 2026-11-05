@@ -5,6 +5,8 @@ import json
 import uuid
 import struct
 import base64
+import gzip
+import zlib
 import hashlib
 import shutil
 import ctypes
@@ -52,8 +54,13 @@ except ImportError:
 
 _BW_SOURCE_START_MARKER = b";!@ByteWrapperSource@UTF-8!"
 _BW_SOURCE_END_MARKER = b";!@ByteWrapperSourceEnd@!"
+_BW_PACKED_SOURCE_START_MARKER = b";!@ByteWrapperSource@GZIP64!"
+_BW_PACKED_SOURCE_END_MARKER = b";!@ByteWrapperSourceGzipEnd@!"
+_BW_ZLIB_SOURCE_START_MARKER = b";!@ByteWrapperSource@ZLIB!"
+_BW_ZLIB_SOURCE_END_MARKER = b";!@ByteWrapperSourceZlibEnd@!"
 _BW_HEADER_SCAN_LIMIT = 12 * 1024 * 1024
 _IO_BUFFER_SIZE = 16 * 1024 * 1024
+_BCJ_X86_RE = re.compile(rb"[\xe8\xe9].{4}", re.DOTALL)
 
 _RUNNABLE_EXTS = (".exe", ".msi", ".bat", ".cmd", ".ps1", ".reg", ".vbs", ".js", ".wsf", ".msc", ".com", ".scr")
 _DIRECT_ICON_EXTS = (".ico", ".png", ".jpg", ".jpeg", ".jxl")
@@ -90,6 +97,7 @@ _CFG_BOOL_KEYS = (
 
 SECRET_EXPORT_KEY = b"ByteWrapper_Config_Cipher_Key"
 _CACHED_TOOL_PATHS: dict[str, str] = {}
+_CACHED_RUNTIME_PACKS: dict[tuple[str, int, int], tuple[str, bytes]] = {}
 _SINGLE_INSTANCE_MUTEX = None
 
 _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -307,13 +315,63 @@ def cleanup_temp_files_now(output_dir: str = ""):
             pass
 
 
+def _get_optimal_runtime_pack(file_path: str) -> tuple[str, bytes]:
+    """Choose raw, gzip, or reversible BCJ+raw-Deflate by actual byte count.
+
+    PE filtering is optional: an incompressible or non-PE input is never made
+    larger, and no special codec is required for the archive's 7z payload.
+    """
+    st = os.stat(file_path)
+    cache_key = (os.path.normcase(os.path.abspath(file_path)), st.st_mtime_ns, st.st_size)
+    cached = _CACHED_RUNTIME_PACKS.get(cache_key)
+    if cached is not None:
+        return cached
+
+    with open(file_path, "rb") as source:
+        original = source.read()
+    best_mode, best_data = "raw", original
+    zipped = gzip.compress(original, compresslevel=9, mtime=0)
+    if len(zipped) < len(best_data):
+        best_mode, best_data = "gz", zipped
+
+    # .NET DeflateStream supports raw Deflate. Avoid the GZIP header/trailer
+    # when the bytes are smaller, without adding any external unpacker.
+    for memory_level in (8, 9):
+        deflater = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS,
+                                   memLevel=memory_level)
+        deflated = deflater.compress(original) + deflater.flush()
+        if len(deflated) < len(best_data):
+            best_mode, best_data = "def", deflated
+
+    # The filter is only useful for executable code. Keep memory bounded for
+    # unexpectedly large binary resources.
+    if len(original) <= 32 * 1024 * 1024 and original[:2] == b"MZ":
+        filtered = bytearray(original)
+        for match in _BCJ_X86_RE.finditer(original):
+            pos = match.start()
+            value = int.from_bytes(original[pos + 1:pos + 5], "little")
+            filtered[pos + 1:pos + 5] = ((value + pos) & 0xFFFFFFFF).to_bytes(4, "little")
+        for memory_level in (8, 9):
+            compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS,
+                                          memLevel=memory_level)
+            packed = compressor.compress(filtered) + compressor.flush()
+            if len(packed) < len(best_data):
+                best_mode, best_data = "bcj", packed
+
+    result = (best_mode, best_data)
+    _CACHED_RUNTIME_PACKS[cache_key] = result
+    return result
+
+
 def process_file(file_path):
     """Open 7-Zip SFX configs or Byte Wrapper's embedded C# source in the default viewer."""
     cleanup_temp_files_now()
     sources = (
-        (b';!@Install@!UTF-8!', b';!@InstallEnd@!', '7-Zip SFX config'),
-        (b';!@Install@!', b';!@InstallEnd@!', '7-Zip SFX config'),
-        (_BW_SOURCE_START_MARKER, _BW_SOURCE_END_MARKER, 'Byte Wrapper generated C# source'),
+        (b';!@Install@!UTF-8!', b';!@InstallEnd@!', '7-Zip SFX config', False),
+        (b';!@Install@!', b';!@InstallEnd@!', '7-Zip SFX config', False),
+        (_BW_SOURCE_START_MARKER, _BW_SOURCE_END_MARKER, 'Byte Wrapper generated C# source', False),
+        (_BW_PACKED_SOURCE_START_MARKER, _BW_PACKED_SOURCE_END_MARKER, 'Byte Wrapper generated C# source', "gzip64"),
+        (_BW_ZLIB_SOURCE_START_MARKER, _BW_ZLIB_SOURCE_END_MARKER, 'Byte Wrapper generated C# source', "zlib"),
     )
     try:
         if not os.path.isfile(file_path):
@@ -326,14 +384,41 @@ def process_file(file_path):
 
         content = None
         source_type = ''
-        for start_marker, end_marker, description in sources:
+        for start_marker, end_marker, description, packed in sources:
             start_idx = data.find(start_marker)
             if start_idx < 0:
                 continue
             end_idx = data.find(end_marker, start_idx + len(start_marker))
             if end_idx < 0 or end_idx - start_idx > 2 * 1024 * 1024:
                 continue
-            content = data[start_idx:end_idx + len(end_marker)].decode('utf-8-sig', errors='replace')
+            if packed == "gzip64":
+                payload = data[start_idx + len(start_marker):end_idx].strip()
+                content = gzip.decompress(base64.b64decode(payload, validate=True)).decode('utf-8-sig')
+            elif packed == "zlib":
+                payload = data[start_idx + len(start_marker):end_idx]
+                if payload.startswith(b"\r\n"):
+                    payload = payload[2:]
+                if payload.endswith(b"\r\n"):
+                    payload = payload[:-2]
+                content = zlib.decompress(payload).decode('utf-8-sig')
+            else:
+                raw_source = data[start_idx:end_idx + len(end_marker)]
+                if start_marker == _BW_SOURCE_START_MARKER:
+                    # Old Byte Wrapper variants used UTF-8 markers with
+                    # a ZLIB:\n prefix and binary zlib data inside.
+                    inner = data[start_idx + len(start_marker):end_idx]
+                    if inner.startswith(b"\r\n"):
+                        inner = inner[2:]
+                    if inner.startswith(b"ZLIB:\n"):
+                        packed = inner[len(b"ZLIB:\n"):]
+                        if packed.endswith(b"\r\n"):
+                            packed = packed[:-2]
+                        content = (
+                            start_marker + b"\r\n" + zlib.decompress(packed)
+                            + b"\r\n" + end_marker
+                        ).decode('utf-8-sig', errors='replace')
+                if content is None:
+                    content = raw_source.decode('utf-8-sig', errors='replace')
             source_type = description
             break
 
@@ -486,7 +571,9 @@ def _to_square_rgba(img: Image.Image) -> Image.Image:
     return src
 
 
-def build_multi_ico_bytes(master_img: Image.Image) -> bytes:
+def build_multi_ico_bytes(
+    master_img: Image.Image, sizes: tuple[tuple[int, int], ...] | None = None
+) -> bytes:
     """Convert a PIL image into multi-resolution Windows .ico bytes in memory."""
     try:
         src = (
@@ -498,11 +585,72 @@ def build_multi_ico_bytes(master_img: Image.Image) -> bytes:
         src.save(
             buf,
             format="ICO",
-            sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16)],
+            sizes=list(sizes) if sizes is not None else [
+                (256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16)
+            ],
         )
         return buf.getvalue()
     except Exception:
         return b""
+
+
+
+def _optimize_ico_png_chunks(ico_data: bytes) -> bytes:
+    """Optimize PNG-compressed ICO entries without removing existing icon sizes.
+
+    Large (64px+) uncompressed DIB/BMP frames can also be converted to PNG if
+    their decoded RGBA pixels remain identical. Windows Vista+ understands PNG
+    frames in ICO. Smaller BMP icons stay untouched for compatibility.
+    """
+    if len(ico_data) < 6:
+        return ico_data
+    reserved, icon_type, count = struct.unpack_from("<HHH", ico_data)
+    if reserved != 0 or icon_type != 1 or not 0 < count <= 256:
+        return ico_data
+    directory_end = 6 + 16 * count
+    if len(ico_data) < directory_end:
+        return ico_data
+
+    entries: list[tuple[bytes, bytes]] = []
+    for idx in range(count):
+        header = bytes(ico_data[6 + 16 * idx:6 + 16 * (idx + 1)])
+        width = header[0] or 256
+        height = header[1] or 256
+        chunk_size, offset = struct.unpack_from("<II", header, 8)
+        if (not chunk_size or offset < directory_end or
+                offset > len(ico_data) or chunk_size > len(ico_data) - offset):
+            return ico_data
+        chunk = ico_data[offset:offset + chunk_size]
+        is_png = chunk.startswith(b"\x89PNG\r\n\x1a\n")
+        # A single-frame ICO permits Pillow to interpret BMP's AND alpha mask.
+        if is_png or (width >= 64 and height >= 64):
+            try:
+                single_header = (struct.pack("<HHH", 0, 1, 1) +
+                                 header[:8] + struct.pack("<II", len(chunk), 22))
+                with Image.open(io.BytesIO(single_header + chunk)) as decoded:
+                    pixels = decoded.convert("RGBA").copy()
+                out = io.BytesIO()
+                pixels.save(out, format="PNG", optimize=True, compress_level=9)
+                candidate = out.getvalue()
+                if len(candidate) < len(chunk):
+                    with Image.open(io.BytesIO(candidate)) as checked:
+                        if (checked.size == pixels.size and
+                                checked.convert("RGBA").tobytes() == pixels.tobytes()):
+                            chunk = candidate
+            except (OSError, ValueError, struct.error):
+                pass
+        entries.append((header, chunk))
+
+    new_data = bytearray(struct.pack("<HHH", 0, 1, count))
+    data_offset = directory_end
+    for header, chunk in entries:
+        new_data.extend(header[:8])
+        new_data.extend(struct.pack("<II", len(chunk), data_offset))
+        data_offset += len(chunk)
+    for _, chunk in entries:
+        new_data.extend(chunk)
+    result = bytes(new_data)
+    return result if len(result) < len(ico_data) else ico_data
 
 
 def _render_parcel_canvas(canvas: int = 512, stroke_scale: float = 1.08) -> Image.Image:
@@ -783,6 +931,13 @@ def extract_icon_from_file(resolved_path: str, icon_idx: int | None = None) -> t
     return b"", None
 
 
+def _get_app_dir() -> str:
+    """Find companion 7-Zip tools next to the script or frozen application."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _find_executable(candidates: tuple[str, ...], cmd_name: str) -> str:
     cached = _CACHED_TOOL_PATHS.get(cmd_name)
     if cached and os.path.isfile(cached):
@@ -855,13 +1010,42 @@ class SFXBuilderWorker(QThread):
 
     @staticmethod
     def find_7zip() -> str:
-        return _find_executable(
+        """Locate an archive writer; prefer full 7z, then standalone 7za/7zr.
+
+        Companion executables are resolved relative to the real application
+        folder, including the PyInstaller one-file case.
+        """
+        app_dir = _get_app_dir()
+        full_7z = _find_executable(
             (
                 r"C:\Program Files\7-Zip\7z.exe",
                 r"C:\Program Files (x86)\7-Zip\7z.exe",
+                os.path.join(app_dir, "7z.exe"),
             ),
             "7z",
         )
+        if full_7z:
+            return full_7z
+
+        # Standalone variants can create .7z archives without 7z.dll.
+        # Preserve x64 -> app folder -> x86 priority for 7za.
+        candidates = (
+            r"C:\Program Files\7-Zip\x64\7za.exe",
+            os.path.join(app_dir, "7za.exe"),
+            r"C:\Program Files\7-Zip\7za.exe",
+            r"C:\Program Files (x86)\7-Zip\7za.exe",
+            r"C:\Program Files\7-Zip\7zr.exe",
+            os.path.join(app_dir, "7zr.exe"),
+            r"C:\Program Files (x86)\7-Zip\7zr.exe",
+        )
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        for name in ("7za", "7zr"):
+            found = shutil.which(name)
+            if found and os.path.isfile(found):
+                return found
+        return ""
 
     @staticmethod
     def find_csc() -> str:
@@ -907,6 +1091,12 @@ class SFXBuilderWorker(QThread):
     def _select_7z_dict_flag(total_bytes: int) -> str:
         """Choose an LZMA2 dictionary size proportional to the input size for fast startup and compression."""
         mb = total_bytes / (1024 * 1024)
+        if mb <= 1:
+            return "-md=1m"
+        if mb <= 2:
+            return "-md=2m"
+        if mb <= 4:
+            return "-md=4m"
         if mb <= 8:
             return "-md=8m"
         if mb <= 16:
@@ -945,28 +1135,32 @@ class SFXBuilderWorker(QThread):
     def build_7z_archive(self, seven_zip: str, source_path: str, archive_path: str) -> int:
         is_dir = self.cfg["source_kind"] == "dir"
         cmd = [seven_zip, "a", "-bso0", "-bsp1"]
-
+        source_bytes = 0
         if self.cfg["compress"]:
-            dict_flag = self._select_7z_dict_flag(self._get_source_total_size(source_path, is_dir))
-            cmd.extend(["-t7z", "-mx=9", "-m0=lzma2", dict_flag, "-mfb=64", "-ms=16g", "-mmt=on"])
+            source_bytes = self._get_source_total_size(source_path, is_dir)
+            dict_flag = self._select_7z_dict_flag(source_bytes)
+            # Preserve v2's >=8 MiB dictionary as the control candidate.
+            # Smaller (1/2/4 MiB) dictionaries are only TRIALS, so they
+            # cannot silently reduce the original compression ratio.
+            baseline_dict_flag = "-md=8m" if source_bytes <= 8 * 1024 * 1024 else dict_flag
+            cmd.extend([
+                "-t7z", "-mx=9", "-m0=lzma2", baseline_dict_flag,
+                "-mfb=273", "-ms=on", "-mqs=on", "-mmt=on",
+            ])
         else:
             cmd.extend(["-t7z", "-mx=0", "-mmt=on"])
 
         if self._archive_7z_pw:
             cmd.extend([f"-p{self._archive_7z_pw}", "-mhe=on"])
-
         cmd.extend(["-y", archive_path, "--"])
         cmd.append(os.path.join(source_path, "*") if is_dir else source_path)
 
         proc = self._start_process(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if proc is None:
             return 255
-
         last_mapped = 20
         try:
             with proc:
@@ -983,17 +1177,170 @@ class SFXBuilderWorker(QThread):
                             if mapped > last_mapped:
                                 last_mapped = mapped
                                 self.progress.emit(mapped)
-                return proc.wait()
+                ret_code = proc.wait()
         finally:
             with self._proc_lock:
                 self._active_proc = None
+
+        # One 7z pass for small/medium payloads instead of 1 baseline plus
+        # 2 slower speculative recompressions. Extractor compatibility is
+        # verified only when the final runtime is selected for compilation.
+        return ret_code
+
+    def _test_extractor_archive(self, extractor: str, archive_path: str) -> bool:
+        """Test the exact 7z stream, including password, with an extractor."""
+        if not archive_path:
+            return True
+        cmd = [extractor, "t", "-t7z", "-y", "-bso0", "-bsp0"]
+        if self._archive_7z_pw:
+            cmd.append(f"-p{self._archive_7z_pw}")
+        cmd.extend(["--", archive_path])
+        try:
+            proc = self._start_process(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if proc is None:
+                return False
+            try:
+                with proc:
+                    return proc.wait() == 0
+            finally:
+                with self._proc_lock:
+                    self._active_proc = None
+        except OSError:
+            return False
+
+    def _extractor_supports_aes(self, extractor: str) -> bool:
+        """Inspect the standalone 7zr's method list before trying AES archives."""
+        try:
+            proc = self._start_process(
+                [extractor, "i"], stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if proc is None:
+                return False
+            try:
+                with proc:
+                    output, _ = proc.communicate()
+                    return (proc.returncode == 0 and
+                            bool(re.search(rb"7z\s*aes|7zaes|aes256", output, re.I)))
+            finally:
+                with self._proc_lock:
+                    self._active_proc = None
+        except OSError:
+            return False
+
+    @staticmethod
+    def _prepare_runtime_resource(
+        source_path: str, work_dir: str, resource_name: str, compress: bool
+    ) -> tuple[str, str]:
+        """Embed the smallest tested encoding; leave uncompressed mode unchanged."""
+        if not compress:
+            return source_path, resource_name
+
+        mode, payload = _get_optimal_runtime_pack(source_path)
+        if mode == "raw":
+            return source_path, resource_name
+        packed_name = resource_name + {"bcj": ".bcj", "def": ".def", "gz": ".gz"}[mode]
+        packed_path = os.path.join(work_dir, packed_name)
+        with open(packed_path, "wb") as output:
+            output.write(payload)
+        return packed_path, packed_name
+
+    @staticmethod
+    def _embedded_runtime_size(path: str) -> int:
+        """Use the exact packing logic that the final compiler resources use."""
+        return len(_get_optimal_runtime_pack(path)[1])
+
+    def _select_sfx_extractor(
+        self, installed_7z: str, archive_path: str = ""
+    ) -> tuple[str, str]:
+        """Choose smallest supported 7z runtime, confirming format and AES.
+
+        7zr can only be used for encrypted archives if its own method list
+        confirms AES and it can test the EXACT archive. Installed 7z remains
+        the safe fallback. Path precedence remains identical to v2.
+        """
+        dll_path = os.path.join(os.path.dirname(installed_7z), "7z.dll")
+        # 7za/7zr are standalone: do not accidentally bundle an adjacent
+        # 7z.dll when a standalone binary was used to create the archive.
+        needs_dll = os.path.basename(installed_7z.replace("\\", "/")).lower() == "7z.exe"
+        installed = (installed_7z, dll_path if needs_dll and os.path.isfile(dll_path) else "")
+        if not self.cfg["compress"]:
+            return installed
+        exe_dir = os.path.dirname(installed_7z)
+        app_dir = _get_app_dir()
+        names = ("7zr.exe", "7za.exe", "7zz.exe")
+        preferred_paths = {
+            "7zr.exe": (
+                r"C:\Program Files\7-Zip\7zr.exe",
+                os.path.join(app_dir, "7zr.exe"),
+            ),
+            "7za.exe": (
+                r"C:\Program Files\7-Zip\x64\7za.exe",
+                os.path.join(app_dir, "7za.exe"),
+                r"C:\Program Files\7-Zip\7za.exe",
+            ),
+            "7zz.exe": (
+                os.path.join(exe_dir, "7zz.exe"),
+                os.path.join(app_dir, "7zz.exe"),
+            ),
+        }
+        candidates = []
+        visited = set()
+        for name in names:
+            search_order = list(preferred_paths[name])
+            fallback = shutil.which(name)
+            if fallback:
+                search_order.append(fallback)
+            for candidate in search_order:
+                key = os.path.normcase(os.path.abspath(candidate))
+                if key not in visited and os.path.isfile(candidate):
+                    candidates.append((candidate, ""))
+                    visited.add(key)
+                    break
+        candidates.append(installed)
+
+        sizes = []
+        for executable, dependency in candidates:
+            try:
+                size = self._embedded_runtime_size(executable)
+                if dependency:
+                    size += self._embedded_runtime_size(dependency)
+                sizes.append((size, executable, dependency))
+            except OSError:
+                pass
+        sizes.sort(key=lambda item: item[0])
+        for _, executable, dependency in sizes:
+            if (self._archive_7z_pw and
+                    os.path.basename(executable.replace("\\", "/")).lower() == "7zr.exe" and
+                    not self._extractor_supports_aes(executable)):
+                continue
+            if self._test_extractor_archive(executable, archive_path):
+                return executable, dependency
+        if archive_path:
+            raise RuntimeError(
+                "No available 7-Zip runtime could verify the generated archive. "
+                "The package was not created to avoid producing an unreadable EXE."
+            )
+        return installed
 
     def compile_csharp_sfx(
         self, csc_path: str, work_dir: str, raw_7z_path: str,
         seven_zip: str, staging_exe: str, base_name: str
     ) -> tuple[bool, str]:
-        seven_zip_dll = os.path.join(os.path.dirname(seven_zip), "7z.dll")
-        has_dll = os.path.isfile(seven_zip_dll)
+        extractor_exe, seven_zip_dll = self._select_sfx_extractor(seven_zip, raw_7z_path)
+        has_dll = bool(seven_zip_dll)
+
+        exe_resource_path, exe_resource_name = self._prepare_runtime_resource(
+            extractor_exe, work_dir, "7z.exe", self.cfg["compress"]
+        )
+        if has_dll:
+            dll_resource_path, dll_resource_name = self._prepare_runtime_resource(
+                seven_zip_dll, work_dir, "7z.dll", self.cfg["compress"]
+            )
 
         source_path = self.cfg["source"]
         cmd_part = self.cfg["cmd_part"]
@@ -1045,7 +1392,11 @@ class SFXBuilderWorker(QThread):
         instances = "true" if self.cfg["instances"] else "false"
         self_remove = "true" if self.cfg["self_remove"] else "false"
         show_progress = "true" if self.cfg["progress_bar"] else "false"
-        extract_dll_line = 'ExtractResource("7z.dll", Path.Combine(workTemp, "7z.dll"));' if has_dll else ""
+        extract_exe_line = f'ExtractResource("{exe_resource_name}", sevenZExe);'
+        extract_dll_line = (
+            f'ExtractResource("{dll_resource_name}", Path.Combine(workTemp, "7z.dll"));'
+            if has_dll else ""
+        )
 
         exec_level = "requireAdministrator" if self.cfg["run_as_admin"] else "asInvoker"
         safe_xml_ver = xml_escape(pe_ver_num, {'"': '&quot;', "'": '&apos;'})
@@ -1068,6 +1419,7 @@ class SFXBuilderWorker(QThread):
         cs_code = rf"""
 using System;
 using System.IO;
+using System.IO.Compression;
 using System.Text;
 using System.Drawing;
 using System.Reflection;
@@ -1296,7 +1648,7 @@ namespace ByteWrapperStub
                     try
                     {{
                         string sevenZExe = Path.Combine(workTemp, "7z.exe");
-                        ExtractResource("7z.exe", sevenZExe);
+                        {extract_exe_line}
                         {extract_dll_line}
 
                         // Native 7-Zip encryption can be read directly from the EXE overlay.
@@ -1636,8 +1988,53 @@ namespace ByteWrapperStub
             {{
                 if (s == null)
                     throw new Exception("Resource not found: " + resName);
-                using (FileStream fs = File.Create(outPath))
-                    s.CopyTo(fs);
+                if (resName.EndsWith(".bcj", StringComparison.OrdinalIgnoreCase))
+                {{
+                    using (MemoryStream restored = new MemoryStream())
+                    {{
+                        using (DeflateStream deflated = new DeflateStream(s, CompressionMode.Decompress))
+                            deflated.CopyTo(restored);
+                        byte[] buf = restored.ToArray();
+                        // Inverse of the optional E8/E9 transform used at build time.
+                        for (int i = 0; i <= buf.Length - 5; )
+                        {{
+                            if (buf[i] == 0xE8 || buf[i] == 0xE9)
+                            {{
+                                unchecked
+                                {{
+                                    uint val = (uint)buf[i + 1] | ((uint)buf[i + 2] << 8) |
+                                        ((uint)buf[i + 3] << 16) | ((uint)buf[i + 4] << 24);
+                                    val -= (uint)i;
+                                    buf[i + 1] = (byte)val;
+                                    buf[i + 2] = (byte)(val >> 8);
+                                    buf[i + 3] = (byte)(val >> 16);
+                                    buf[i + 4] = (byte)(val >> 24);
+                                }}
+                                i += 5;
+                            }}
+                            else i++;
+                        }}
+                        File.WriteAllBytes(outPath, buf);
+                    }}
+                }}
+                else
+                {{
+                    using (FileStream fs = File.Create(outPath))
+                    {{
+                        if (resName.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
+                        {{
+                            using (GZipStream zipped = new GZipStream(s, CompressionMode.Decompress))
+                                zipped.CopyTo(fs);
+                        }}
+                        else if (resName.EndsWith(".def", StringComparison.OrdinalIgnoreCase))
+                        {{
+                            using (DeflateStream deflated = new DeflateStream(s, CompressionMode.Decompress))
+                                deflated.CopyTo(fs);
+                        }}
+                        else
+                            s.CopyTo(fs);
+                    }}
+                }}
             }}
         }}
 
@@ -1734,17 +2131,37 @@ namespace ByteWrapperStub
             "/nologo",
             "/target:winexe",
             "/optimize+",
+            "/debug-",
+            "/filealign:512",
             "/reference:System.dll",
             "/reference:System.Drawing.dll",
             "/reference:System.Windows.Forms.dll",
             f"/out:{work_exe}",
             f"/win32manifest:{manifest_path}",
-            f"/resource:{seven_zip},7z.exe",
+            f"/resource:{exe_resource_path},{exe_resource_name}",
         ]
         if has_dll:
-            csc_cmd.append(f"/resource:{seven_zip_dll},7z.dll")
+            csc_cmd.append(f"/resource:{dll_resource_path},{dll_resource_name}")
 
         icon_bytes = self.cfg.get("icon_bytes") or get_default_sfx_icon_bytes()
+        if self.cfg["compress"]:
+            # Optimize only generated/default icons. Preserve original .ico and PE
+            # icon frames, which may have hand-crafted artwork at small sizes.
+            icon_source = self.cfg.get("icon_source", "")
+            source_ext = os.path.splitext(icon_source)[1].lower()
+            if not self.cfg.get("icon_bytes") or source_ext in (".png", ".jpg", ".jpeg", ".jxl"):
+                icon_image = (
+                    load_pil_from_ico_bytes(icon_bytes)
+                    if self.cfg.get("icon_bytes") else get_default_parcel_image()
+                )
+                if icon_image is not None:
+                    compact_icon = build_multi_ico_bytes(
+                        icon_image, ((256, 256), (48, 48), (32, 32), (16, 16))
+                    )
+                    if compact_icon and len(compact_icon) < len(icon_bytes):
+                        icon_bytes = compact_icon
+        if icon_bytes and self.cfg["compress"]:
+            icon_bytes = _optimize_ico_png_chunks(icon_bytes)
         if icon_bytes:
             work_icon_path = os.path.join(work_dir, "icon.ico")
             with open(work_icon_path, "wb") as f_ico:
@@ -1790,11 +2207,27 @@ namespace ByteWrapperStub
 
             with open(staging_exe, "ab") as output:
                 if not (self.cfg["crypto"] or self.cfg["password"]):
-                    output.write(
-                        b"\r\n" + _BW_SOURCE_START_MARKER + b"\r\n"
-                        + cs_code.encode("utf-8")
-                        + b"\r\n" + _BW_SOURCE_END_MARKER + b"\r\n"
-                    )
+                    source_bytes = cs_code.encode("utf-8")
+                    packed_source = b""
+                    if self.cfg["compress"]:
+                        for memory_level in (8, 9):
+                            encoder = zlib.compressobj(9, zlib.DEFLATED,
+                                                       zlib.MAX_WBITS, memLevel=memory_level)
+                            candidate = encoder.compress(source_bytes) + encoder.flush()
+                            if not packed_source or len(candidate) < len(packed_source):
+                                packed_source = candidate
+                    if packed_source and len(packed_source) < len(source_bytes):
+                        output.write(
+                            b"\r\n" + _BW_ZLIB_SOURCE_START_MARKER + b"\r\n"
+                            + packed_source
+                            + b"\r\n" + _BW_ZLIB_SOURCE_END_MARKER + b"\r\n"
+                        )
+                    else:
+                        output.write(
+                            b"\r\n" + _BW_SOURCE_START_MARKER + b"\r\n"
+                            + source_bytes
+                            + b"\r\n" + _BW_SOURCE_END_MARKER + b"\r\n"
+                        )
 
                 processed = 0
                 last_emitted = 70
