@@ -28,7 +28,10 @@ Getting Started
 
 How To Install and Run
 
-    You will need to have python and 7zip installed in your system and install necessary python components for this script to run. If you have 7za.exe and 7zr.exe near script or in 7-Zip folder, script will prefer them to reduce size even more.
-    First install components via cmd, second save script via notepad and name it as "Byte Wrapper.py" or download and run.    
+    To run this software, ensure 7-Zip is installed on your system or place its files in the script directory. When building packages, the script will automatically prioritize 7za.exe and 7zr.exe—if found next to the script or in the 7-Zip folder—to minimize package size.
+    
+    To run as a script, first install components via cmd, second save script via notepad and name it as "Byte Wrapper.py" or download and run.
     pip install PyQt6 Pillow pillow-jxl-plugin pywin32 pyinstaller
-    or use compiled version.
+
+    To run as a standalone package, download compiled version or compile yourself.
+    py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl "Byte Wrapper - Icon Sync.py"
