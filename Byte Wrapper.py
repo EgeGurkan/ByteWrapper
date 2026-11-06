@@ -21,7 +21,7 @@ from xml.sax.saxutils import escape as xml_escape
 # Support #
 # Update Python # py -m pip install --upgrade pip
 # Install Components # py -m pip install PyQt6 Pillow pillow-jxl-plugin pyinstaller
-# Compile # py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl "Byte Wrapper.py"
+# Compile # py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl "Byte Wrapper - Final.py"
 
 # ==============================================================================
 # 1. GLOBAL COMMANDS, CONSTANTS & CORE UTILITIES
@@ -3758,7 +3758,7 @@ class ByteWrapperWindow(QWidget):
 
         self.inp_version = ScrollingLineEdit()
         self.inp_version.setObjectName("VersionInput")
-        self.inp_version.setPlaceholderText("Ver...")
+        self.inp_version.setPlaceholderText("Version...")
         self.inp_version.setToolTip("Package file version (e.g. 1.0.0.0)")
         self.inp_version.setFixedHeight(34)
         ver_part = r"(?:6553[0-4]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4})"
