@@ -1,7 +1,7 @@
 # Byte Wrapper
 Byte Wrapper—a lightweight, user-friendly utility designed to bundle your scripts, files, and installers into seamless, self-contained executable packages (.exe).  Whether you're deploying batch files, PowerShell scripts, or custom tools, Byte Wrapper helps you automate execution, hide command windows, and secure your files effortlessly.
 
-<img width="377" height="596" alt="Byte Wrapper" src="https://github.com/user-attachments/assets/0fa3ab90-4ce2-45bd-944c-e4da212189a5" />
+<img width="380" height="680" alt="ByteWrapper" src="https://github.com/user-attachments/assets/ea148fa2-30fa-4491-af5f-1f44f788110b" />
 
 Key Features at a Glance
 
@@ -31,3 +31,4 @@ How To Install and Run
     You will need to have python and 7zip installed in your system and install necessary python components for this script to run. If you have 7za.exe and 7zr.exe near script or in 7-Zip folder, script will prefer them to reduce size even more.
     First install components via cmd, second save script via notepad and name it as "Byte Wrapper.py" or download and run.    
     pip install PyQt6 Pillow pillow-jxl-plugin pywin32 pyinstaller
+    or use compiled version.
