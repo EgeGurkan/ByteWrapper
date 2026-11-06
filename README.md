@@ -34,4 +34,4 @@ How To Install and Run
     pip install PyQt6 Pillow pillow-jxl-plugin pywin32 pyinstaller
 
     -Run as a standalone package, download compiled version or compile yourself.
-    py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl "Byte Wrapper - Icon Sync.py"
+    py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl "Byte Wrapper.py"
