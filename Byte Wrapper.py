@@ -21,7 +21,7 @@ from xml.sax.saxutils import escape as xml_escape
 # Support #
 # Update Python # py -m pip install --upgrade pip
 # Install Components # py -m pip install PyQt6 Pillow pillow-jxl-plugin pyinstaller
-# Compile # py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl "Byte Wrapper.py"
+# Compile # py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Byte Wrapper" --icon "Byte.ICO" --collect-all pillow_jxl "Byte Wrapper - Icon Sync.py"
 
 # ==============================================================================
 # 1. GLOBAL COMMANDS, CONSTANTS & CORE UTILITIES
@@ -35,15 +35,15 @@ except Exception:
     pass
 
 from PyQt6.QtCore import (
-    Qt, QPoint, QThread, pyqtSignal, QSize, QTimer, QRegularExpression
+    Qt, QPoint, QUrl, QEvent, QPropertyAnimation, QEasingCurve, QThread, pyqtSignal, QSize, QTimer, QRegularExpression
 )
 from PyQt6.QtGui import (
-    QIcon, QImage, QPixmap, QDragEnterEvent, QDropEvent, QRegularExpressionValidator
+    QIcon, QImage, QPixmap, QDragEnterEvent, QDropEvent, QRegularExpressionValidator, QDesktopServices, QCursor
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QCheckBox, QProgressBar,
-    QFileDialog, QMenu, QMessageBox
+    QFileDialog, QMenu, QMessageBox, QDialog
 )
 
 from PIL import Image, ImageDraw
@@ -89,6 +89,7 @@ _PCT_RE = re.compile(rb"(?:^|[\r\n\x08])\s*(\d{1,3})%(?=\s|$)")
 _CFG_STR_KEYS = (
     "source", "extract_to", "run_file", "output",
     "name", "description", "version", "icon_source", "password",
+    "shortcut_icon_source", "shortcut_name", "shortcut_path", "shortcut_run_file",
 )
 _CFG_BOOL_KEYS = (
     "run_as_admin", "hidden_run", "dont_replace", "extract_only",
@@ -1327,6 +1328,50 @@ class SFXBuilderWorker(QThread):
             )
         return installed
 
+    def _compile_uninstaller_resource(self, csc_path: str, work_dir: str,
+                                      app_name: str, icon_bytes: bytes) -> tuple[str, str]:
+        """Compile an embedded, manifest-driven silent uninstaller only for installer packages."""
+        uninstall_source = 'using System;\nusing System.IO;\nusing System.Text;\nusing System.Collections.Generic;\nusing System.Diagnostics;\nusing System.Security.Cryptography;\nusing System.Reflection;\n\n[assembly: AssemblyTitle("__APP_NAME__ Uninstaller")]\n[assembly: AssemblyProduct("__APP_NAME__")]\nnamespace ByteWrapperUninstaller\n{\n    static class Program\n    {\n        private const string PackageId = "__PACKAGE_ID__";\n        private const string Header = "BW_UNINSTALL_V1|" + PackageId;\n        private const string ManifestName = "Uninstall.info";\n        private const string UninstallerName = "Uninstall.exe";\n\n        [STAThread]\n        static void Main(string[] args)\n        {\n            try\n            {\n                if (args.Length == 3 && args[0] == "--bw-uninstall")\n                {\n                    // Wait until the original Uninstall.exe releases its file handle.\n                    int parentPid;\n                    if (int.TryParse(args[2], out parentPid))\n                    {\n                        try { using (Process parent = Process.GetProcessById(parentPid))\n                            parent.WaitForExit(5000); }\n                        catch { }\n                    }\n                    RemoveInstalledFiles(args[1]);\n                    QueueTemporaryExeCleanup();\n                    return;\n                }\n                string installDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);\n                if (string.IsNullOrEmpty(installDir) || !File.Exists(Path.Combine(installDir, ManifestName)))\n                    return;\n                string tempCopy = Path.Combine(Path.GetTempPath(),\n                    "bw_uninstaller_" + Guid.NewGuid().ToString("N") + ".exe");\n                File.Copy(Assembly.GetExecutingAssembly().Location, tempCopy, false);\n                ProcessStartInfo psi = new ProcessStartInfo(tempCopy,\n                    "--bw-uninstall " + Quote(installDir) + " " + Process.GetCurrentProcess().Id);\n                psi.UseShellExecute = false;\n                psi.CreateNoWindow = true;\n                psi.WindowStyle = ProcessWindowStyle.Hidden;\n                Process.Start(psi);\n            }\n            catch { /* An unattended uninstaller must not display a dialog. */ }\n        }\n\n        private static string Quote(string path)\n        {\n            // A trailing backslash must be doubled before a Windows closing quote.\n            if (path.EndsWith("\\\\")) path += "\\\\";\n            return "\\"" + path.Replace("\\"", "\\\\\\"") + "\\"";\n        }\n\n        private static string Decode(string base64)\n        {\n            return Encoding.UTF8.GetString(Convert.FromBase64String(base64));\n        }\n\n        private static string FileDigest(string path)\n        {\n            using (FileStream input = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read))\n            using (SHA256 sha = SHA256.Create())\n                return BitConverter.ToString(sha.ComputeHash(input)).Replace("-", "");\n        }\n\n        private static bool IsWithin(string root, string candidate)\n        {\n            string prefix = Path.GetFullPath(root).TrimEnd(\'\\\\\') + "\\\\";\n            return candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);\n        }\n\n        private static bool RemoveVerifiedFile(string path, string expectedHash)\n        {\n            try\n            {\n                if (!File.Exists(path)) return true;\n                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0) return false;\n                if (!string.Equals(FileDigest(path), expectedHash, StringComparison.OrdinalIgnoreCase))\n                    return false; // Never remove files modified after installation.\n                FileAttributes flags = File.GetAttributes(path);\n                if ((flags & FileAttributes.ReadOnly) != 0)\n                    File.SetAttributes(path, flags & ~FileAttributes.ReadOnly);\n                File.Delete(path);\n                return true;\n            }\n            catch { return false; }\n        }\n\n        private static void RemoveInstalledFiles(string installationPath)\n        {\n            string root = Path.GetFullPath(installationPath);\n            string info = Path.Combine(root, ManifestName);\n            if (!File.Exists(info)) return;\n            string[] lines = File.ReadAllLines(info, Encoding.UTF8);\n            if (lines.Length < 2 || lines[0] != Header || !lines[1].StartsWith("ROOT|")) return;\n            if (!string.Equals(Path.GetFullPath(Decode(lines[1].Substring(5))), root,\n                    StringComparison.OrdinalIgnoreCase)) return;\n\n            // Validate every manifest entry before doing ANY removal.\n            List<string[]> files = new List<string[]>();\n            List<string> folders = new List<string>();\n            for (int i = 2; i < lines.Length; i++)\n            {\n                string[] fields = lines[i].Split(\'|\');\n                if (fields.Length == 3 && (fields[0] == "F" || fields[0] == "S"))\n                {\n                    string path = Decode(fields[1]);\n                    if (fields[0] == "F")\n                    {\n                        if (Path.IsPathRooted(path)) return;\n                        path = Path.GetFullPath(Path.Combine(root, path));\n                        if (!IsWithin(root, path)) return;\n                    }\n                    else\n                    {\n                        if (!Path.IsPathRooted(path)) return;\n                        path = Path.GetFullPath(path);\n                        if (!path.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) return;\n                    }\n                    if (fields[2].Length != 64) return;\n                    files.Add(new string[] { path, fields[2] });\n                }\n                else if (fields.Length == 2 && fields[0] == "D")\n                {\n                    string path = Decode(fields[1]);\n                    if (Path.IsPathRooted(path)) return;\n                    path = Path.GetFullPath(Path.Combine(root, path));\n                    if (!IsWithin(root, path) && !string.Equals(root, path,\n                            StringComparison.OrdinalIgnoreCase)) return;\n                    folders.Add(path);\n                }\n                else return;\n            }\n\n            bool success = true;\n            foreach (string[] file in files)\n                if (!RemoveVerifiedFile(file[0], file[1])) success = false;\n            // If a file is locked or changed, leave the uninstall record and EXE\n            // in place so the user can retry; never delete unrelated files.\n            if (!success) return;\n            try { File.Delete(info); }\n            catch { return; }\n            try { File.Delete(Path.Combine(root, UninstallerName)); }\n            catch { /* The manifest is already removed; leave a harmless EXE. */ }\n\n            // Directories are removed ONLY if created by this installer and empty.\n            folders.Sort(delegate(string a, string b) { return b.Length.CompareTo(a.Length); });\n            foreach (string folder in folders)\n            {\n                try { if (Directory.Exists(folder)) Directory.Delete(folder, false); }\n                catch { /* Existing content or other files: do not touch it. */ }\n            }\n        }\n\n        private static void QueueTemporaryExeCleanup()\n        {\n            try\n            {\n                string ownPath = Assembly.GetExecutingAssembly().Location;\n                if (!Path.GetFullPath(ownPath).StartsWith(Path.GetFullPath(Path.GetTempPath()),\n                    StringComparison.OrdinalIgnoreCase)) return;\n                ProcessStartInfo psi = new ProcessStartInfo("cmd.exe",\n                    "/C ping -n 3 127.0.0.1 >nul & del /F /Q " + Quote(ownPath));\n                psi.CreateNoWindow = true;\n                psi.UseShellExecute = false;\n                psi.WindowStyle = ProcessWindowStyle.Hidden;\n                Process.Start(psi);\n            }\n            catch { }\n        }\n    }\n}\n'
+        uninstall_source = uninstall_source.replace(
+            "using System.Reflection;\n\n", "using System.Reflection;\nusing Microsoft.Win32;\n\n"
+        )
+        uninstall_source = uninstall_source.replace(
+            "        private static string Quote(string path)\n",
+            '        private static string UninstallRegistryKey(string installDir)\n        {\n            string canonical = Path.GetFullPath(installDir).TrimEnd(\'\\\\\').ToUpperInvariant();\n            using (SHA256 hash = SHA256.Create())\n            {\n                byte[] bytes = hash.ComputeHash(Encoding.UTF8.GetBytes(canonical));\n                string suffix = BitConverter.ToString(bytes).Replace("-", "").Substring(0, 16);\n                return @"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ByteWrapper_" + PackageId + "_" + suffix;\n            }\n        }\n' + "\n        private static string Quote(string path)\n",
+        )
+        uninstall_source = uninstall_source.replace(
+            "            try { File.Delete(Path.Combine(root, UninstallerName)); }",
+            '            // Remove only this exact install entry, after verified removal succeeded.\n            try { Registry.CurrentUser.DeleteSubKeyTree(UninstallRegistryKey(root), false); }\n            catch { }\n            try { File.Delete(Path.Combine(root, UninstallerName)); }',
+        )
+        uninstall_source = (uninstall_source
+            .replace("__APP_NAME__", app_name.replace('\\', '\\\\').replace('"', '\\"'))
+            .replace("__PACKAGE_ID__", self._uninstall_package_id))
+        source_file = os.path.join(work_dir, "ByteWrapperUninstaller.cs")
+        output_file = os.path.join(work_dir, "ByteWrapperUninstaller.exe")
+        icon_file = os.path.join(work_dir, "ByteWrapperUninstaller.ico")
+        with open(source_file, "w", encoding="utf-8-sig") as fh:
+            fh.write(uninstall_source)
+        with open(icon_file, "wb") as fh:
+            fh.write(icon_bytes or get_default_sfx_icon_bytes())
+        cmd = [csc_path, "/nologo", "/target:winexe", "/optimize+", "/debug-",
+               "/reference:System.dll", f"/win32icon:{icon_file}",
+               f"/out:{output_file}", source_file]
+        proc = self._start_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, encoding="utf-8", errors="replace",
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+        if proc is None:
+            raise RuntimeError("Uninstaller compilation canceled.")
+        try:
+            with proc:
+                stdout, stderr = proc.communicate()
+                code = proc.returncode
+        finally:
+            with self._proc_lock:
+                self._active_proc = None
+        if code != 0 or not os.path.isfile(output_file):
+            raise RuntimeError("Uninstaller C# compilation failed:\n" + stdout + "\n" + stderr)
+        return output_file, "ByteWrapperUninstaller.exe"
+
     def compile_csharp_sfx(
         self, csc_path: str, work_dir: str, raw_7z_path: str,
         seven_zip: str, staging_exe: str, base_name: str
@@ -1382,6 +1427,43 @@ class SFXBuilderWorker(QThread):
         run_target_str = cs_escape(run_target_rel)
         run_args_str = cs_escape(run_args_raw)
 
+        shortcut_active = bool(self.cfg.get("shortcut_active"))
+        installer_mode = bool(self.cfg["extract_only"] and shortcut_active and not self.cfg["hidden_run"])
+        self._uninstall_package_id = uuid.uuid4().hex if installer_mode else ""
+        uninstall_resource_file = ""
+        uninstall_resource_name = ""
+        if installer_mode:
+            uninstall_resource_file, uninstall_resource_name = self._compile_uninstaller_resource(
+                csc_path, work_dir, base_name, self.cfg.get("icon_bytes") or get_default_sfx_icon_bytes()
+            )
+        shortcut_target_rel = ""
+        if shortcut_active:
+            _, shortcut_target_rel = _resolve_run_file(
+                source_path, self.cfg["shortcut_command"],
+                source_resolved=True, source_kind=self.cfg["source_kind"]
+            )
+        shortcut_name_str = cs_escape(self.cfg.get("shortcut_name", "").strip())
+        shortcut_path_str = cs_escape(self.cfg.get("shortcut_path", "").strip())
+        shortcut_target_str = cs_escape(shortcut_target_rel)
+        # .lnk files have a Description/Comment field, but no native Version
+        # property. Show the explicitly entered version in that field as well.
+        shortcut_comment = []
+        if raw_desc.strip():
+            shortcut_comment.append(raw_desc.strip())
+        typed_version = self.cfg.get("version", "").strip()
+        if typed_version:
+            shortcut_comment.append("Version: " + typed_version)
+        shortcut_description_str = cs_escape(" | ".join(shortcut_comment))
+        shortcut_args_str = cs_escape(self.cfg.get("shortcut_args", ""))
+        shortcut_icon_bytes = self.cfg.get("shortcut_icon_bytes") or b""
+        shortcut_icon_file = ""
+        shortcut_icon_resource = "ByteWrapperShortcut.ico"
+        uninstall_id_str = cs_escape(self._uninstall_package_id)
+        if shortcut_active and shortcut_icon_bytes:
+            shortcut_icon_file = os.path.join(work_dir, "shortcut_icon.ico")
+            with open(shortcut_icon_file, "wb") as shortcut_ico_out:
+                shortcut_ico_out.write(shortcut_icon_bytes)
+
         ask_user_pw = "true" if self.cfg["password"] else "false"
         expected_user_pw_hash = cs_escape(self._expected_user_pw_hash)
         internal_7z_pw_str = cs_escape(self._stub_embedded_7z_pw)
@@ -1416,6 +1498,55 @@ class SFXBuilderWorker(QThread):
         with open(manifest_path, "w", encoding="utf-8") as f:
             f.write(manifest_xml)
 
+        installer_support_code = '        // Installer mode extracts to temporary staging first. This makes it\n        // possible to identify each owned file and NEVER overwrite existing data.\n        private static bool InsideFolder(string root, string path)\n        {\n            return Path.GetFullPath(path).StartsWith(\n                Path.GetFullPath(root).TrimEnd(\'\\\\\') + "\\\\", StringComparison.OrdinalIgnoreCase);\n        }\n\n        private static void RollBackInstaller(string root, List<string> files,\n            List<string> shortcuts, List<string> folders, bool withUninstaller)\n        {\n            foreach (string link in shortcuts)\n                try { if (File.Exists(link)) File.Delete(link); } catch { }\n            foreach (string file in files)\n                try { if (InsideFolder(root, file) && File.Exists(file)) File.Delete(file); } catch { }\n            if (withUninstaller)\n            {\n                try { File.Delete(Path.Combine(root, "Uninstall.info")); } catch { }\n                try { File.Delete(Path.Combine(root, "Uninstall.exe")); } catch { }\n            }\n            folders.Sort(delegate(string a, string b) { return b.Length.CompareTo(a.Length); });\n            foreach (string folder in folders)\n                try { if (Directory.Exists(folder)) Directory.Delete(folder, false); } catch { }\n        }\n\n        private static void InstallPayload(string staged, string destination,\n            List<string> ownedFiles, List<string> createdDirs)\n        {\n            Stack<string> pending = new Stack<string>();\n            pending.Push(staged);\n            while (pending.Count != 0)\n            {\n                string current = pending.Pop();\n                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)\n                    throw new IOException("Reparse points in installation archives are not supported.");\n                foreach (string folder in Directory.GetDirectories(current))\n                {\n                    if ((File.GetAttributes(folder) & FileAttributes.ReparsePoint) != 0)\n                        throw new IOException("Reparse points in installation archives are not supported.");\n                    string relative = folder.Substring(staged.Length).TrimStart(\'\\\\\');\n                    string dest = Path.GetFullPath(Path.Combine(destination, relative));\n                    if (!InsideFolder(destination, dest))\n                        throw new IOException("Archive path escaped installation folder.");\n                    if (!Directory.Exists(dest))\n                    {\n                        Directory.CreateDirectory(dest);\n                        createdDirs.Add(dest);\n                    }\n                    pending.Push(folder);\n                }\n                foreach (string file in Directory.GetFiles(current))\n                {\n                    if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)\n                        throw new IOException("Reparse points in installation archives are not supported.");\n                    string relative = file.Substring(staged.Length).TrimStart(\'\\\\\');\n                    string dest = Path.GetFullPath(Path.Combine(destination, relative));\n                    if (!InsideFolder(destination, dest))\n                        throw new IOException("Archive path escaped installation folder.");\n                    string destParent = Path.GetDirectoryName(dest);\n                    if (!Directory.Exists(destParent))\n                    {\n                        Directory.CreateDirectory(destParent);\n                        createdDirs.Add(destParent);\n                    }\n                    if (File.Exists(dest)) continue;\n                    File.Copy(file, dest, false);\n                    ownedFiles.Add(dest);\n                }\n            }\n        }\n\n        private static string ToB64(string input)\n        {\n            return Convert.ToBase64String(Encoding.UTF8.GetBytes(input));\n        }\n\n        private static string Sha256(string file)\n        {\n            using (FileStream stream = File.Open(file, FileMode.Open, FileAccess.Read, FileShare.Read))\n            using (SHA256 sha = SHA256.Create())\n                return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "");\n        }\n\n        private static void WriteUninstallInfo(string info, string root,\n            List<string> owned, List<string> shortcuts, List<string> folders)\n        {\n            using (StreamWriter writer = new StreamWriter(\n                new FileStream(info, FileMode.CreateNew, FileAccess.Write), new UTF8Encoding(false)))\n            {\n                writer.WriteLine("BW_UNINSTALL_V1|" + UNINSTALL_PACKAGE_ID);\n                writer.WriteLine("ROOT|" + ToB64(Path.GetFullPath(root)));\n                foreach (string file in owned)\n                {\n                    if (!InsideFolder(root, file)) continue;\n                    if (!File.Exists(file)) continue;\n                    string relative = file.Substring(Path.GetFullPath(root).TrimEnd(\'\\\\\').Length).TrimStart(\'\\\\\');\n                    writer.WriteLine("F|" + ToB64(relative) + "|" + Sha256(file));\n                }\n                foreach (string shortcut in shortcuts)\n                    if (File.Exists(shortcut))\n                        writer.WriteLine("S|" + ToB64(Path.GetFullPath(shortcut)) + "|" + Sha256(shortcut));\n                foreach (string folder in folders)\n                {\n                    string relative = string.Equals(Path.GetFullPath(folder), Path.GetFullPath(root),\n                        StringComparison.OrdinalIgnoreCase) ? "." :\n                        folder.Substring(Path.GetFullPath(root).TrimEnd(\'\\\\\').Length).TrimStart(\'\\\\\');\n                    writer.WriteLine("D|" + ToB64(relative));\n                }\n            }\n        }\n\n' if installer_mode else ""
+        if installer_mode:
+            installer_support_code += '        private static string UninstallRegistryKey(string installDir)\n        {\n            string canonical = Path.GetFullPath(installDir).TrimEnd(\'\\\\\').ToUpperInvariant();\n            using (SHA256 hash = SHA256.Create())\n            {\n                byte[] bytes = hash.ComputeHash(Encoding.UTF8.GetBytes(canonical));\n                string suffix = BitConverter.ToString(bytes).Replace("-", "").Substring(0, 16);\n                return @"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ByteWrapper_" + UNINSTALL_PACKAGE_ID + "_" + suffix;\n            }\n        }\n\n        private static void RegisterWindowsUninstall(string installDir)\n        {\n            string keyName = UninstallRegistryKey(installDir);\n            try\n            {\n                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(keyName))\n                {\n                    if (key == null) throw new IOException("Could not register the uninstaller.");\n                    string uninstallExe = Path.Combine(installDir, "Uninstall.exe");\n                    key.SetValue("DisplayName", "{prod_name_str}", RegistryValueKind.String);\n                    key.SetValue("DisplayVersion", "{pe_ver_info_str}", RegistryValueKind.String);\n                    key.SetValue("Publisher", "Byte Wrapper", RegistryValueKind.String);\n                    key.SetValue("InstallLocation", installDir, RegistryValueKind.String);\n                    key.SetValue("DisplayIcon", uninstallExe + ",0", RegistryValueKind.String);\n                    key.SetValue("UninstallString", "\\"" + uninstallExe + "\\"", RegistryValueKind.String);\n                    key.SetValue("QuietUninstallString", "\\"" + uninstallExe + "\\"", RegistryValueKind.String);\n                    key.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd"), RegistryValueKind.String);\n                    key.SetValue("NoModify", 1, RegistryValueKind.DWord);\n                    key.SetValue("NoRepair", 1, RegistryValueKind.DWord);\n                }\n            }\n            catch\n            {\n                try { Registry.CurrentUser.DeleteSubKeyTree(keyName, false); } catch { }\n                throw;\n            }\n        }\n'.replace("{prod_name_str}", prod_name_str).replace("{pe_ver_info_str}", pe_ver_info_str)
+        installer_ui_code = '        // Only visible installer packages contain this UI and the uninstaller resource.\n        // The monochrome controls directly override the build-time shortcut settings.\n        private sealed class GrayToggle : CheckBox\n        {\n            private static readonly Font LabelFont = new Font("Segoe UI", 8F);\n\n            public GrayToggle(string title)\n            {\n                Text = title;\n                Checked = true;\n                AutoSize = false;\n                Height = 24;\n                Width = 145;\n                SetStyle(ControlStyles.AllPaintingInWmPaint |\n                    ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);\n            }\n            protected override void OnPaint(PaintEventArgs e)\n            {\n                e.Graphics.Clear(Parent != null ? Parent.BackColor : Color.FromArgb(249, 249, 249));\n                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;\n                Rectangle r = new Rectangle(2, 6, 28, 14);\n                using (GraphicsPath p = new GraphicsPath())\n                {\n                    p.AddArc(r.Left, r.Top, 14, 14, 90, 180);\n                    p.AddArc(r.Right - 14, r.Top, 14, 14, 270, 180);\n                    p.CloseFigure();\n                    using (SolidBrush b = new SolidBrush(Checked\n                        ? Color.FromArgb(104, 104, 104) : Color.FromArgb(191, 191, 191)))\n                        e.Graphics.FillPath(b, p);\n                }\n                int cx = Checked ? 22 : 9;\n                using (SolidBrush b = new SolidBrush(Color.WhiteSmoke))\n                    e.Graphics.FillEllipse(b, cx - 5, 8, 10, 10);\n                TextRenderer.DrawText(e.Graphics, Text, LabelFont,\n                    new Rectangle(37, 3, 108, 20), Color.FromArgb(33, 33, 33),\n                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter);\n            }\n        }\n\n        // Paint the text in two tones; WinForms\' standard Button has only one ForeColor.\n        private sealed class CountdownInstallButton : Button\n        {\n            public int SecondsLeft = 60;\n            public bool ShowCountdown = true;\n            public CountdownInstallButton()\n            {\n                Text = "";\n                SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |\n                         ControlStyles.OptimizedDoubleBuffer, true);\n            }\n            protected override void OnPaint(PaintEventArgs e)\n            {\n                base.OnPaint(e);\n                string word = "INSTALL";\n                string count = ShowCountdown ? " (" + SecondsLeft.ToString() + ")" : "";\n                TextFormatFlags flags = TextFormatFlags.NoPadding | TextFormatFlags.SingleLine;\n                Size first = TextRenderer.MeasureText(e.Graphics, word, Font, Size.Empty, flags);\n                Size second = TextRenderer.MeasureText(e.Graphics, count, Font, Size.Empty, flags);\n                int x = Math.Max(0, (ClientSize.Width - first.Width - second.Width) / 2);\n                int y = Math.Max(0, (ClientSize.Height - Font.Height) / 2);\n                TextRenderer.DrawText(e.Graphics, word, Font, new Point(x, y),\n                    Color.FromArgb(15, 15, 15), flags);\n                if (ShowCountdown)\n                    TextRenderer.DrawText(e.Graphics, count, Font,\n                        new Point(x + first.Width, y), Color.FromArgb(154, 154, 154), flags);\n            }\n        }\n\n        private static string PromptInstallerPath(string defaultPath,\n            out bool createShortcuts, out bool createUninstaller)\n        {\n            createShortcuts = true;\n            createUninstaller = true;\n            using (Form dialog = new Form())\n            {\n                dialog.Text = "__APP_NAME__";\n                dialog.ClientSize = new Size(263, 154);\n                dialog.FormBorderStyle = FormBorderStyle.FixedDialog;\n                dialog.StartPosition = FormStartPosition.CenterScreen;\n                dialog.MaximizeBox = false;\n                dialog.MinimizeBox = false;\n                dialog.BackColor = Color.FromArgb(249, 249, 249);\n                dialog.Font = new Font("Segoe UI", 9F);\n                try { dialog.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }\n                Label heading = new Label();\n                heading.Text = "Select Unpacking Location";\n                heading.Bounds = new Rectangle(11, 12, 242, 21);\n                dialog.Controls.Add(heading);\n\n                TextBox pathInput = new TextBox();\n                pathInput.Text = defaultPath;\n                pathInput.AutoSize = false;\n                pathInput.Bounds = new Rectangle(11, 45, 215, 23);\n                pathInput.BorderStyle = BorderStyle.FixedSingle;\n                dialog.Controls.Add(pathInput);\n                Button browse = new Button();\n                browse.Text = "...";\n                browse.Bounds = new Rectangle(pathInput.Right, pathInput.Top, 25, pathInput.Height);\n                browse.FlatStyle = FlatStyle.Popup;\n                dialog.Controls.Add(browse);\n\n                GrayToggle shortcuts = new GrayToggle("Create Shortcuts");\n                shortcuts.Location = new Point(9, 82);\n                dialog.Controls.Add(shortcuts);\n                GrayToggle uninstaller = new GrayToggle("Create Uninstaller");\n                uninstaller.Location = new Point(9, 109);\n                dialog.Controls.Add(uninstaller);\n                CountdownInstallButton install = new CountdownInstallButton();\n                install.Font = new Font("Segoe UI", 8F, FontStyle.Bold);\n                install.FlatStyle = FlatStyle.Popup;\n                install.Bounds = new Rectangle(155, 94, 96, 29);\n                dialog.Controls.Add(install);\n                dialog.AcceptButton = install;\n\n                string selectedPath = null;\n                bool wantsShortcuts = true, wantsUninstaller = true;\n                browse.Click += delegate\n                {\n                    using (FolderBrowserDialog picker = new FolderBrowserDialog())\n                    {\n                        picker.Description = "Select extraction folder";\n                        string original = Environment.ExpandEnvironmentVariables(\n                            pathInput.Text.Trim().Trim(\'"\'));\n                        if (Directory.Exists(original)) picker.SelectedPath = original;\n                        if (picker.ShowDialog(dialog) == DialogResult.OK)\n                            pathInput.Text = picker.SelectedPath;\n                    }\n                };\n                install.Click += delegate\n                {\n                    try\n                    {\n                        string input = Environment.ExpandEnvironmentVariables(\n                            pathInput.Text.Trim().Trim(\'"\').Replace(\'/\', \'\\\\\'));\n                        if (string.IsNullOrWhiteSpace(input))\n                            throw new ArgumentException("Extraction path cannot be empty.");\n                        if (input.Length == 2 && input[1] == \':\') input += "\\\\";\n                        selectedPath = Path.GetFullPath(input);\n                        wantsShortcuts = shortcuts.Checked;\n                        wantsUninstaller = uninstaller.Checked;\n                        dialog.DialogResult = DialogResult.OK;\n                        dialog.Close();\n                    }\n                    catch (Exception ex)\n                    {\n                        MessageBox.Show(dialog, "Invalid extraction path: " + ex.Message,\n                            dialog.Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);\n                    }\n                };\n                // Only untouched dialogs auto-install, with the original defaults.\n                // Any user input stops the countdown so a manual choice is never overridden.\n                System.Windows.Forms.Timer unattendedTimer = new System.Windows.Forms.Timer();\n                unattendedTimer.Interval = 1000;\n                int remainingSeconds = 60;\n                bool manuallySelected = false;\n                Action stopAutoInstall = delegate\n                {\n                    manuallySelected = true;\n                    unattendedTimer.Stop();\n                    install.ShowCountdown = false;\n                    install.Invalidate();\n                };\n                pathInput.KeyDown += delegate { stopAutoInstall(); };\n                pathInput.MouseDown += delegate { stopAutoInstall(); };\n                browse.MouseDown += delegate { stopAutoInstall(); };\n                shortcuts.MouseDown += delegate { stopAutoInstall(); };\n                uninstaller.MouseDown += delegate { stopAutoInstall(); };\n                install.MouseDown += delegate { stopAutoInstall(); };\n                dialog.MouseDown += delegate { stopAutoInstall(); };\n                pathInput.TextChanged += delegate { stopAutoInstall(); };\n                shortcuts.CheckedChanged += delegate { stopAutoInstall(); };\n                uninstaller.CheckedChanged += delegate { stopAutoInstall(); };\n                unattendedTimer.Tick += delegate\n                {\n                    if (manuallySelected || dialog.IsDisposed) { unattendedTimer.Stop(); return; }\n                    remainingSeconds--;\n                    install.SecondsLeft = Math.Max(0, remainingSeconds);\n                    install.Invalidate();\n                    if (remainingSeconds <= 0)\n                    {\n                        unattendedTimer.Stop();\n                        install.PerformClick(); // same path validation as pressing INSTALL\n                    }\n                };\n                dialog.Shown += delegate { unattendedTimer.Start(); };\n                dialog.FormClosed += delegate { unattendedTimer.Stop(); unattendedTimer.Dispose(); };\n                if (dialog.ShowDialog() == DialogResult.OK)\n                {\n                    createShortcuts = wantsShortcuts;\n                    createUninstaller = wantsUninstaller;\n                    return selectedPath;\n                }\n                return null;\n            }\n        }\n\n' if installer_mode else ""
+        if installer_mode:
+            installer_ui_code = installer_ui_code.replace("__APP_NAME__", prod_name_str)
+            # Mirror the main-window slow overflow panning in the installer's path field.
+            # No additional UI resources are embedded in non-installer packages.
+            installer_path_pan = r"""
+                int panPosition = 0, panDirection = 1, panHold = 8;
+                System.Windows.Forms.Timer pathPanTimer = new System.Windows.Forms.Timer();
+                pathPanTimer.Interval = 155;
+                pathInput.TextChanged += delegate { panPosition = 0; panDirection = 1; panHold = 8; };
+                pathPanTimer.Tick += delegate
+                {
+                    if (!pathInput.Visible || pathInput.Focused || pathInput.Text.Length == 0)
+                        return;
+                    if (TextRenderer.MeasureText(pathInput.Text, pathInput.Font).Width <=
+                        pathInput.ClientSize.Width - 12)
+                        return;
+                    if (panHold > 0) { panHold--; return; }
+                    panPosition = Math.Max(0, Math.Min(pathInput.Text.Length, panPosition + panDirection));
+                    pathInput.SelectionStart = panPosition;
+                    pathInput.SelectionLength = 0;
+                    if (panPosition == 0 || panPosition == pathInput.Text.Length)
+                    {
+                        panDirection = -panDirection;
+                        panHold = 8;
+                    }
+                };
+                dialog.FormClosed += delegate { pathPanTimer.Stop(); pathPanTimer.Dispose(); };
+                pathPanTimer.Start();
+"""
+            installer_ui_code = installer_ui_code.replace(
+                "                dialog.Controls.Add(pathInput);\n",
+                "                dialog.Controls.Add(pathInput);\n" + installer_path_pan,
+            )
+        installer_prompt_code = '                if (installerSelected)\n                {\n                    string selectedPath = PromptInstallerPath(expanded, out createShortcuts, out createUninstaller);\n                    if (selectedPath == null)\n                        return; // User pressed Cancel or closed the dialog.\n                    expanded = selectedPath;\n                }\n' if installer_mode else ""
+        installer_copy_code = '                if (installerSelected)\n                {\n                    string stagedPayload = Path.Combine(workTemp, "payload");\n                    if (createUninstaller &&\n                        (File.Exists(Path.Combine(stagedPayload, "Uninstall.exe")) ||\n                         File.Exists(Path.Combine(stagedPayload, "Uninstall.info"))))\n                        throw new IOException("Archive contains reserved uninstaller filenames.");\n                    InstallPayload(stagedPayload, targetDir, installedFiles, createdDirectories);\n                }\n\n' if installer_mode else ""
+        installer_uninstall_code = '                if (installerSelected && createUninstaller)\n                {\n                    string uninstaller = Path.Combine(targetDir, "Uninstall.exe");\n                    string uninstallInfo = Path.Combine(targetDir, "Uninstall.info");\n                    ExtractResource("ByteWrapperUninstaller.exe", uninstaller);\n                    WriteUninstallInfo(uninstallInfo, targetDir, installedFiles,\n                        installedShortcuts, createdDirectories);\n                    RegisterWindowsUninstall(targetDir);\n                }\n\n' if installer_mode else ""
+        installer_rollback_code = '                if (installerSelected)\n                    RollBackInstaller(targetDir, installedFiles, installedShortcuts,\n                        createdDirectories, createUninstaller);' if installer_mode else ""
+
+        common_folder_guard = r"""        private static bool InsideFolder(string root, string path)
+        {
+            return Path.GetFullPath(path).StartsWith(
+                Path.GetFullPath(root).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase);
+        }
+""" if not installer_mode else ""
+
         cs_code = rf"""
 using System;
 using System.IO;
@@ -1430,6 +1561,9 @@ using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Security.Cryptography;
 using System.Windows.Forms;
+using System.Collections.Generic;
+using System.Drawing.Drawing2D;
+using Microsoft.Win32;
 
 [assembly: AssemblyTitle("{file_desc_str}")]
 [assembly: AssemblyDescription("{file_desc_str}")]
@@ -1446,6 +1580,14 @@ namespace ByteWrapperStub
         private static readonly string EXTRACT_TO = "{extract_to_str}";
         private static readonly string RUN_TARGET = "{run_target_str}";
         private static readonly string RUN_ARGS = "{run_args_str}";
+        private static readonly bool CREATE_SHORTCUT = {str(shortcut_active).lower()};
+        private static readonly bool INSTALLER_MODE = {str(installer_mode).lower()};
+        private static readonly string UNINSTALL_PACKAGE_ID = "{uninstall_id_str}";
+        private static readonly string SHORTCUT_NAME = "{shortcut_name_str}";
+        private static readonly string SHORTCUT_PATH = "{shortcut_path_str}";
+        private static readonly string SHORTCUT_TARGET = "{shortcut_target_str}";
+        private static readonly string SHORTCUT_ARGS = "{shortcut_args_str}";
+        private static readonly string SHORTCUT_DESCRIPTION = "{shortcut_description_str}";
         private static readonly string INTERNAL_7Z_PW = "{internal_7z_pw_str}";
         private static readonly bool ASK_USER_PW = {ask_user_pw};
         private static readonly string EXPECTED_USER_PW_HASH = "{expected_user_pw_hash}";
@@ -1609,13 +1751,28 @@ namespace ByteWrapperStub
                 runtime7zPw = verifiedPw;
             }}
 
+            bool createShortcuts = CREATE_SHORTCUT;
+            bool createUninstaller = false;
+            bool installerSelected = INSTALLER_MODE;
+            bool rootCreated = false;
             string targetDir;
             try
             {{
-                string expanded = Environment.ExpandEnvironmentVariables(EXTRACT_TO.Trim().Trim('"').Replace("/", "\\"));
+                string configuredPath = EXTRACT_TO.Trim().Trim('"');
+                string expanded = string.IsNullOrWhiteSpace(configuredPath)
+                    ? Path.GetTempPath()
+                    : Environment.ExpandEnvironmentVariables(configuredPath.Replace("/", "\\"));
+                // Without any shortcut configuration, Extract Only uses the
+                // configured directory directly and does not ask for a location.
+                {installer_prompt_code}
                 if (expanded.Length == 2 && expanded[1] == ':')
                     expanded += "\\";
                 targetDir = Path.GetFullPath(expanded);
+                if (installerSelected && createUninstaller &&
+                    (File.Exists(Path.Combine(targetDir, "Uninstall.exe")) ||
+                     File.Exists(Path.Combine(targetDir, "Uninstall.info"))))
+                    throw new IOException("Uninstall.exe or Uninstall.info already exists at the destination.");
+                rootCreated = !Directory.Exists(targetDir);
                 Directory.CreateDirectory(targetDir);
             }}
             catch (Exception ex)
@@ -1640,6 +1797,11 @@ namespace ByteWrapperStub
             }}
 
             Exception extractError = null;
+            List<string> installedFiles = new List<string>();
+            List<string> installedShortcuts = new List<string>();
+            List<string> createdDirectories = new List<string>();
+            if (installerSelected && rootCreated)
+                createdDirectories.Add(targetDir);
 
             try
             {{
@@ -1655,7 +1817,10 @@ namespace ByteWrapperStub
                         string archivePath = Application.ExecutablePath;
 
                         bool trackProgress = (reportProgress != null);
-                        string outSwitch = targetDir.TrimEnd('\\');
+                        string destination = installerSelected
+                            ? Path.Combine(workTemp, "payload") : targetDir;
+                        Directory.CreateDirectory(destination);
+                        string outSwitch = destination.TrimEnd('\\');
                         if (outSwitch.Length == 2 && outSwitch[1] == ':')
                             outSwitch += "\\";
                         StringBuilder args = new StringBuilder();
@@ -1722,7 +1887,8 @@ namespace ByteWrapperStub
                     }}
                 }};
 
-                if (SHOW_PROGRESS && !HIDDEN_RUN)
+                // Extract Only with no shortcut configured has no progress UI.
+                if (SHOW_PROGRESS && !HIDDEN_RUN && (!EXTRACT_ONLY || CREATE_SHORTCUT))
                 {{
                     ProgressBar pbControl;
                     Label lblControl;
@@ -1789,6 +1955,22 @@ namespace ByteWrapperStub
 
                 if (extractError != null)
                     throw extractError;
+                {installer_copy_code}
+
+                if (createShortcuts)
+                {{
+                    try {{ CreatePackageShortcuts(targetDir,
+                        installerSelected ? installedFiles : null,
+                        installerSelected ? installedShortcuts : null); }}
+                    catch (Exception shortcutEx)
+                    {{
+                        if (!HIDDEN_RUN)
+                            MessageBox.Show("Shortcut creation failed: " + shortcutEx.Message,
+                                "{prod_name_str}", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }}
+                }}
+
+                {installer_uninstall_code}
 
                 if (!EXTRACT_ONLY && !string.IsNullOrWhiteSpace(RUN_TARGET))
                 {{
@@ -1797,6 +1979,7 @@ namespace ByteWrapperStub
             }}
             catch (Exception ex)
             {{
+                {installer_rollback_code}
                 if (!HIDDEN_RUN)
                     MessageBox.Show("Package processing failed: " + ex.Message,
                         "Byte Wrapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -1820,6 +2003,101 @@ namespace ByteWrapperStub
             if (SELF_REMOVE)
             {{
                 SelfDeleteExe();
+            }}
+        }}
+
+
+        {installer_support_code}
+        {common_folder_guard}
+
+        private static void CreatePackageShortcuts(string targetDir,
+            List<string> createdPackageFiles, List<string> createdShortcutFiles)
+        {{
+            string relFile = Environment.ExpandEnvironmentVariables(
+                SHORTCUT_TARGET.Trim().Trim('"').Replace("/", "\\"));
+            string targetFile = Path.IsPathRooted(relFile)
+                ? Path.GetFullPath(relFile)
+                : Path.GetFullPath(Path.Combine(targetDir, relFile));
+            if (!File.Exists(targetFile))
+                throw new FileNotFoundException("Shortcut Run File not found", targetFile);
+            if (createdPackageFiles != null && !InsideFolder(targetDir, targetFile))
+                throw new IOException("Installer shortcut target must be inside the selected folder.");
+
+            // Place the shortcut icon beside its Run File, using the same
+            // filename stem. Example: bin\My App.exe -> bin\My App.ico.
+            string iconPath = Path.Combine(Path.GetDirectoryName(targetFile),
+                Path.GetFileNameWithoutExtension(targetFile) + ".ico");
+            // Preserve an existing icon rather than overwriting a user-owned file.
+            bool iconAlreadyExisted = File.Exists(iconPath);
+            if (!iconAlreadyExisted || createdPackageFiles == null)
+            {{
+                ExtractResource("ByteWrapperShortcut.ico", iconPath);
+                if (createdPackageFiles != null)
+                    createdPackageFiles.Add(iconPath);
+            }}
+
+            string name = SHORTCUT_NAME.Trim();
+            if (name.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+                name = name.Substring(0, name.Length - 4);
+            name += ".lnk";
+
+            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            string startMenu = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
+            string[] destinationFolders;
+            if (string.Equals(SHORTCUT_PATH, "Desktop", StringComparison.OrdinalIgnoreCase))
+                destinationFolders = new string[] {{ desktop }};
+            else if (string.Equals(SHORTCUT_PATH, "Start Menu", StringComparison.OrdinalIgnoreCase))
+                destinationFolders = new string[] {{ startMenu }};
+            else if (string.Equals(SHORTCUT_PATH, "Start Menu & Desktop", StringComparison.OrdinalIgnoreCase))
+                destinationFolders = new string[] {{ startMenu, desktop }};
+            else
+                destinationFolders = new string[] {{ Path.GetFullPath(
+                    Environment.ExpandEnvironmentVariables(SHORTCUT_PATH.Trim().Trim('"'))) }};
+
+            Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType == null)
+                throw new InvalidOperationException("Windows Script Host is not available.");
+            object shell = Activator.CreateInstance(shellType);
+            try
+            {{
+                foreach (string directory in destinationFolders)
+                {{
+                    Directory.CreateDirectory(directory);
+                    string shortcutFile = Path.Combine(directory, name);
+                    if (createdShortcutFiles != null && File.Exists(shortcutFile))
+                        continue; // Installer mode must not overwrite existing shortcuts.
+                    object link = shellType.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod,
+                        null, shell, new object[] {{ shortcutFile }});
+                    try
+                    {{
+                        Type linkType = link.GetType();
+                        linkType.InvokeMember("TargetPath", BindingFlags.SetProperty,
+                            null, link, new object[] {{ targetFile }});
+                        linkType.InvokeMember("Arguments", BindingFlags.SetProperty,
+                            null, link, new object[] {{ Environment.ExpandEnvironmentVariables(SHORTCUT_ARGS) }});
+                        linkType.InvokeMember("WorkingDirectory", BindingFlags.SetProperty,
+                            null, link, new object[] {{ Path.GetDirectoryName(targetFile) }});
+                        linkType.InvokeMember("IconLocation", BindingFlags.SetProperty,
+                            null, link, new object[] {{ iconPath + ",0" }});
+                        if (!string.IsNullOrWhiteSpace(SHORTCUT_DESCRIPTION))
+                            linkType.InvokeMember("Description", BindingFlags.SetProperty,
+                                null, link, new object[] {{ SHORTCUT_DESCRIPTION }});
+                        linkType.InvokeMember("Save", BindingFlags.InvokeMethod,
+                            null, link, new object[0]);
+                        if (createdShortcutFiles != null)
+                            createdShortcutFiles.Add(shortcutFile);
+                    }}
+                    finally
+                    {{
+                        if (link != null && Marshal.IsComObject(link))
+                            Marshal.FinalReleaseComObject(link);
+                    }}
+                }}
+            }}
+            finally
+            {{
+                if (shell != null && Marshal.IsComObject(shell))
+                    Marshal.FinalReleaseComObject(shell);
             }}
         }}
 
@@ -2070,6 +2348,8 @@ namespace ByteWrapperStub
             return f;
         }}
 
+        {installer_ui_code}
+
         private static string PromptPassword()
         {{
             using (Form f = new Form())
@@ -2142,6 +2422,10 @@ namespace ByteWrapperStub
         ]
         if has_dll:
             csc_cmd.append(f"/resource:{dll_resource_path},{dll_resource_name}")
+        if shortcut_icon_file:
+            csc_cmd.append(f"/resource:{shortcut_icon_file},{shortcut_icon_resource}")
+        if uninstall_resource_file:
+            csc_cmd.append(f"/resource:{uninstall_resource_file},{uninstall_resource_name}")
 
         icon_bytes = self.cfg.get("icon_bytes") or get_default_sfx_icon_bytes()
         if self.cfg["compress"]:
@@ -2366,7 +2650,56 @@ class IconDropButton(_FileDropMixin, QPushButton):
         self.setAcceptDrops(True)
 
 
-class SmartLineEdit(QLineEdit):
+class ScrollingLineEdit(QLineEdit):
+    """Slowly pan overflowing text left/right when the field is not being edited.
+
+    QLineEdit owns its horizontal viewport. Advancing the caret while unfocused
+    scrolls that viewport without modifying the value or breaking normal editing.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pan_cursor = 0
+        self._pan_direction = 1
+        self._pan_pause_ticks = 8
+        self._pan_timer = QTimer(self)
+        self._pan_timer.setInterval(155)
+        self._pan_timer.timeout.connect(self._pan_step)
+        self.textChanged.connect(self._pan_reset)
+        self._pan_timer.start()
+
+    def _pan_reset(self, _text=""):
+        self._pan_cursor = 0
+        self._pan_direction = 1
+        self._pan_pause_ticks = 8
+        if not self.hasFocus():
+            self.setCursorPosition(0)
+
+    def _pan_step(self):
+        if not self.isVisible() or not self.isEnabled() or self.hasFocus():
+            return
+        raw = self.text()
+        if not raw:
+            return
+        # Honour the actual font metrics and the available area after padding.
+        visible_width = max(10, self.contentsRect().width() - 18)
+        displayed = raw if self.echoMode() == QLineEdit.EchoMode.Normal else ("•" * len(raw))
+        if self.fontMetrics().horizontalAdvance(displayed) <= visible_width:
+            return
+        if self._pan_pause_ticks:
+            self._pan_pause_ticks -= 1
+            return
+        self._pan_cursor = max(0, min(len(raw), self._pan_cursor + self._pan_direction))
+        self.setCursorPosition(self._pan_cursor)
+        if self._pan_cursor in (0, len(raw)):
+            self._pan_direction *= -1
+            self._pan_pause_ticks = 8
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._pan_reset()
+
+
+class SmartLineEdit(ScrollingLineEdit):
     """Supports direct typing, drag-and-drop, and right-click / empty-left-click preset menus."""
     def __init__(self, placeholder="", mode="source", parent_win=None):
         super().__init__(parent_win)
@@ -2378,7 +2711,7 @@ class SmartLineEdit(QLineEdit):
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
-        if event.button() == Qt.MouseButton.LeftButton and not self.text().strip():
+        if event.button() == Qt.MouseButton.LeftButton and (not self.text().strip() or self.mode == "shortcut_path"):
             QTimer.singleShot(0, self.open_selector)
 
     def contextMenuEvent(self, event):
@@ -2419,17 +2752,27 @@ class SmartLineEdit(QLineEdit):
                 ("2. %Temp%", "%Temp%"),
                 ("3. %SystemDrive%", "%SystemDrive%"),
                 ("4. %SystemDrive%\\Program Files", "%SystemDrive%\\Program Files"),
+                ("5. %SystemDrive%\\Program Files (x86)", "%SystemDrive%\\Program Files (x86)"),
+                ("6. %SystemDrive%\\ProgramData", "%SystemDrive%\\ProgramData"),
+                ("7. %UserProfile%\\Documents", "%UserProfile%\\Documents"),
+                ("8. %AppData%", "%AppData%"),
+                ("9. %LocalAppData%", "%LocalAppData%"),
             ):
                 presets[menu.addAction(label)] = val
         elif self.mode == "output":
             act_folder = menu.addAction("1. Select Folder...")
             presets[menu.addAction("2. %UserProfile%\\Desktop")] = "%UserProfile%\\Desktop"
-        elif self.mode == "run_file":
+        elif self.mode in ("run_file", "shortcut_run_file"):
             act_file = menu.addAction("1. Select Executable / Script File...")
+        elif self.mode == "shortcut_path":
+            presets[menu.addAction("1. Desktop")] = "Desktop"
+            presets[menu.addAction("2. Start Menu")] = "Start Menu"
+            presets[menu.addAction("3. Start Menu && Desktop")] = "Start Menu & Desktop"
 
         menu.addSeparator()
         act_manual = menu.addAction(
-            "Type Command / Path Manually" if self.mode == "run_file" else "Type Manually"
+            "Type Command / Path Manually"
+            if self.mode in ("run_file", "shortcut_run_file") else "Type Manually"
         )
 
         action = menu.exec(self.mapToGlobal(QPoint(0, self.height())))
@@ -2443,7 +2786,7 @@ class SmartLineEdit(QLineEdit):
                 self._set_selected_path(expand_path(folder))
         elif action == act_file:
             start_dir = ""
-            if self.mode == "run_file" and self.parent_win:
+            if self.mode in ("run_file", "shortcut_run_file") and self.parent_win:
                 src = self.parent_win._resolved_source
                 src_kind = self.parent_win._source_kind
                 start_dir = src if src_kind == "dir" else (os.path.dirname(src) if src_kind == "file" else "")
@@ -2451,7 +2794,7 @@ class SmartLineEdit(QLineEdit):
             if file_path:
                 self._set_selected_path(
                     self._format_run_file_selection(file_path)
-                    if self.mode == "run_file" else expand_path(file_path)
+                    if self.mode in ("run_file", "shortcut_run_file") else expand_path(file_path)
                 )
         elif action == act_manual:
             self.setFocus()
@@ -2485,12 +2828,12 @@ class SmartLineEdit(QLineEdit):
                     self.parent_win._fail_start("Please drop a folder, not a file, into this field.")
                 event.ignore()
                 return
-            if self.mode == "run_file" and os.path.isdir(dropped_path):
+            if self.mode in ("run_file", "shortcut_run_file") and os.path.isdir(dropped_path):
                 if self.parent_win is not None:
                     self.parent_win._fail_start("Run File must be an executable or script file, not a folder.")
                 event.ignore()
                 return
-            if self.mode == "run_file":
+            if self.mode in ("run_file", "shortcut_run_file"):
                 self._set_selected_path(self._format_run_file_selection(dropped_path))
             else:
                 self._set_selected_path(dropped_path)
@@ -2502,6 +2845,32 @@ class SmartLineEdit(QLineEdit):
 # ==============================================================================
 # 4. MAIN APPLICATION WINDOW (ORGANIZED BY GUI SECTIONS)
 # ==============================================================================
+class DraggableInfoDialog(QDialog):
+    """Minimal frameless info popup; drag the empty surface to reposition it."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_offset = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
 class ByteWrapperWindow(QWidget):
     # --------------------------------------------------------------------------
     # 4.1. GUI INITIALIZATION, STYLES & WINDOW CONTROLS
@@ -2509,12 +2878,16 @@ class ByteWrapperWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Byte Wrapper")
-        self.setFixedSize(380, 600)
+        self.setFixedSize(380, 680)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.setAcceptDrops(True)
 
         self.current_icon_bytes: bytes = b""
         self.current_icon_source: str = ""
+        self.current_shortcut_icon_source: str = ""
+        self.current_shortcut_icon_bytes: bytes = b""
+        # Share the first non-default icon choice once, then keep icons independent.
+        self._initial_icon_sync_done = False
 
         cleanup_temp_files_now()
 
@@ -2545,8 +2918,201 @@ class ByteWrapperWindow(QWidget):
         self._status_reset_timer.setSingleShot(True)
         self._status_reset_timer.timeout.connect(self.reset_start_status)
 
+        # Debounce PE icon extraction while Run File is being typed.
+        self._run_file_icon_timer = QTimer(self)
+        self._run_file_icon_timer.setSingleShot(True)
+        self._run_file_icon_timer.timeout.connect(self._refresh_auto_icon_from_run_file)
+
+        self._info_dialog = None
+        self._info_links = {}
+        self._info_animation = None
+        self._info_hover_timer = QTimer(self)
+        self._info_hover_timer.setSingleShot(True)
+        self._info_hover_timer.setInterval(500)
+        self._info_hover_timer.timeout.connect(self.show_info_dialog)
+        self._info_hide_timer = QTimer(self)
+        self._info_hide_timer.setSingleShot(True)
+        self._info_hide_timer.setInterval(160)
+        self._info_hide_timer.timeout.connect(self._maybe_hide_info)
+
         self.init_ui()
         self.apply_styles()
+
+    @staticmethod
+    def _seven_zip_availability() -> dict[str, bool]:
+        """Check standard 7-Zip locations first, then the real script/EXE folder."""
+        roots = []
+        seen_roots = set()
+        for path in (
+            os.environ.get("ProgramW6432"),
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+        ):
+            if path:
+                normalized = os.path.normcase(path)
+                if normalized not in seen_roots:
+                    seen_roots.add(normalized)
+                    roots.append(path)
+        app_dir = _get_app_dir()
+        result = {}
+        for label, executable in (("7zip", "7z.exe"), ("7za", "7za.exe"), ("7zr", "7zr.exe")):
+            # Do not treat binaries shipped beside the application as the default
+            # installation: the application folder is intentionally the fallback.
+            standard_locations = [os.path.join(root, "7-Zip", executable) for root in roots]
+            standard_locations.extend(
+                os.path.join(root, "7-Zip", "x64", executable) for root in roots
+            )
+            result[label] = (
+                any(os.path.isfile(candidate) for candidate in standard_locations)
+                or os.path.isfile(os.path.join(app_dir, executable))
+            )
+        return result
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "btn_info", None):
+            if event.type() == QEvent.Type.Enter:
+                self._info_hide_timer.stop()
+                if self._info_dialog is None or not self._info_dialog.isVisible():
+                    self._info_hover_timer.start()
+                else:
+                    self._animate_info(True)
+            elif event.type() == QEvent.Type.Leave:
+                self._info_hover_timer.stop()
+                self._info_hide_timer.start()
+        elif obj is self._info_dialog:
+            if event.type() == QEvent.Type.Enter:
+                self._info_hide_timer.stop()
+                if self._info_dialog.isVisible():
+                    self._animate_info(True)
+            elif event.type() == QEvent.Type.Leave:
+                self._info_hide_timer.start()
+        return super().eventFilter(obj, event)
+
+    def _cursor_over_info(self) -> bool:
+        cursor = QCursor.pos()
+        if self.btn_info.isVisible() and self.btn_info.rect().contains(
+            self.btn_info.mapFromGlobal(cursor)
+        ):
+            return True
+        popup = self._info_dialog
+        if popup is not None and popup.isVisible():
+            if getattr(popup, "_drag_offset", None) is not None:
+                return True
+            if popup.rect().contains(popup.mapFromGlobal(cursor)):
+                return True
+        return False
+
+    def _maybe_hide_info(self):
+        if not self._cursor_over_info():
+            self._info_hover_timer.stop()
+            self._animate_info(False)
+
+    def _animate_info(self, appearing: bool):
+        dialog = self._info_dialog
+        if dialog is None or (not appearing and not dialog.isVisible()):
+            return
+        if self._info_animation is not None:
+            self._info_animation.stop()
+        anim = QPropertyAnimation(dialog, b"windowOpacity", self)
+        anim.setDuration(180 if appearing else 200)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.setStartValue(dialog.windowOpacity())
+        anim.setEndValue(1.0 if appearing else 0.0)
+        self._info_animation = anim
+        if not appearing:
+            def hide_when_faded():
+                if (self._info_animation is anim and not self._cursor_over_info()
+                        and dialog.windowOpacity() <= 0.02):
+                    dialog.hide()
+            anim.finished.connect(hide_when_faded)
+        anim.start()
+
+    def show_info_dialog(self):
+        """Present a fade-in hover popup without activating a separate window."""
+        if not self._cursor_over_info():
+            return
+        dialog = self._info_dialog
+        if dialog is None:
+            dialog = DraggableInfoDialog(self)
+            dialog.setObjectName("InfoDialog")
+            dialog.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            dialog.setFixedSize(182, 86)
+            dialog.setStyleSheet("""
+                QDialog#InfoDialog {
+                    background-color: #0b1016;
+                    border: 1px solid #263445;
+                }
+                QPushButton#InfoLinkBtn, QPushButton#InfoStatusBtn {
+                    background: transparent;
+                    border: none;
+                    padding: 0px;
+                    font-size: 12px;
+                    text-decoration: none;
+                }
+                QLabel#InfoSeparator { color: #8792a0; background: transparent; }
+            """)
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(9, 14, 9, 11)
+            layout.setSpacing(5)
+            layout.addStretch(1)
+
+            github = QPushButton("github", dialog)
+            github.setObjectName("InfoLinkBtn")
+            github.setFlat(True)
+            github.setFixedHeight(20)
+            github.setCursor(Qt.CursorShape.PointingHandCursor)
+            github.setStyleSheet("QPushButton { color: #a0adbc; text-decoration: none; } "
+                                 "QPushButton:hover { color: #d6dfe7; text-decoration: none; }")
+            github.clicked.connect(lambda: QDesktopServices.openUrl(
+                QUrl("https://github.com/EgeGurkan/ByteWrapper")))
+            layout.addWidget(github, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+            link_row = QHBoxLayout()
+            link_row.setSpacing(0)
+            link_row.addStretch(1)
+            for index, label in enumerate(("7zip", "7za", "7zr")):
+                if index:
+                    separator = QLabel(" - ", dialog)
+                    separator.setObjectName("InfoSeparator")
+                    link_row.addWidget(separator)
+                link = QPushButton(label, dialog)
+                link.setObjectName("InfoStatusBtn")
+                link.setFlat(True)
+                link.setFixedHeight(20)
+                link.setCursor(Qt.CursorShape.PointingHandCursor)
+                link.clicked.connect(lambda: QDesktopServices.openUrl(
+                    QUrl("https://www.7-zip.org/download.html")))
+                link_row.addWidget(link)
+                self._info_links[label] = link
+            link_row.addStretch(1)
+            layout.addLayout(link_row)
+            layout.addStretch(1)
+            self._info_dialog = dialog
+            dialog.installEventFilter(self)
+
+        # Refresh at each appearance (not only at program startup).
+        for name, found in self._seven_zip_availability().items():
+            link = self._info_links[name]
+            color = "#80d49a" if found else "#e37a80"
+            hover_color = "#a8edbc" if found else "#ffabb1"
+            link.setStyleSheet(
+                "QPushButton { background: transparent; border: none; padding: 0; "
+                f"color: {color}; text-decoration: none; }} "
+                f"QPushButton:hover {{ color: {hover_color}; text-decoration: none; }}"
+            )
+            link.setToolTip("Found" if found else "Not found")
+
+        # Popup touches the ? button edge so the mouse can move between them.
+        top_right = self.btn_info.mapToGlobal(QPoint(self.btn_info.width(), self.btn_info.height()))
+        dialog.move(top_right.x() - dialog.width(), top_right.y())
+        if not dialog.isVisible():
+            dialog.setWindowOpacity(0.0)
+            dialog.show()
+        self._info_hide_timer.stop()
+        self._animate_info(True)
 
     @staticmethod
     def _make_section_label(text: str) -> QLabel:
@@ -2587,6 +3153,14 @@ class ByteWrapperWindow(QWidget):
 
         header_layout.addStretch()
 
+        btn_info = QPushButton("?")
+        btn_info.setObjectName("WinControlBtn")
+        btn_info.setFixedSize(26, 26)
+        # Show the lightweight info popup after 0.5 seconds of hovering.
+        # Avoid a native tooltip overlapping the popup.
+        self.btn_info = btn_info
+        btn_info.installEventFilter(self)
+
         btn_min = QPushButton("—")
         btn_min.setObjectName("WinControlBtn")
         btn_min.setFixedSize(26, 26)
@@ -2597,6 +3171,7 @@ class ByteWrapperWindow(QWidget):
         btn_close.setFixedSize(26, 26)
         btn_close.clicked.connect(self.close)
 
+        header_layout.addWidget(btn_info, alignment=Qt.AlignmentFlag.AlignTop)
         header_layout.addWidget(btn_min, alignment=Qt.AlignmentFlag.AlignTop)
         header_layout.addWidget(btn_close, alignment=Qt.AlignmentFlag.AlignTop)
         main_layout.addLayout(header_layout)
@@ -2651,33 +3226,74 @@ class ByteWrapperWindow(QWidget):
             QRegularExpression(r'^[^\\/:*?"<>|\x00-\x1f]*$'), self
         )
 
-        self.inp_name = QLineEdit()
+        self.inp_name = ScrollingLineEdit()
         self.inp_name.setPlaceholderText("Name...")
         self.inp_name.setFixedHeight(34)
         self.inp_name.setValidator(win_filename_validator)
         self.inp_name.textEdited.connect(self.on_name_manually_edited)
         self.inp_name.textChanged.connect(self._sync_dont_replace_state)
-        nd_layout.addWidget(self.inp_name, stretch=4)
+        nd_layout.addWidget(self.inp_name, stretch=3)
 
-        self.inp_desc = QLineEdit()
+        self.inp_desc = ScrollingLineEdit()
         self.inp_desc.setPlaceholderText("Description...")
         self.inp_desc.setFixedHeight(34)
         self.inp_desc.setValidator(win_filename_validator)
-        nd_layout.addWidget(self.inp_desc, stretch=4)
+        nd_layout.addWidget(self.inp_desc, stretch=3)
 
-        self.inp_version = QLineEdit()
+        self.inp_version = ScrollingLineEdit()
         self.inp_version.setObjectName("VersionInput")
         self.inp_version.setPlaceholderText("Ver...")
         self.inp_version.setToolTip("Package file version (e.g. 1.0.0.0)")
-        self.inp_version.setFixedSize(64, 34)
+        self.inp_version.setFixedHeight(34)
         ver_part = r"(?:6553[0-4]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4})"
         ver_validator = QRegularExpressionValidator(
             QRegularExpression(rf"^(?:{ver_part}(?:\.{ver_part}){{0,3}})?$"), self.inp_version
         )
         self.inp_version.setValidator(ver_validator)
-        nd_layout.addWidget(self.inp_version)
+        nd_layout.addWidget(self.inp_version, stretch=3)
 
         main_layout.addLayout(nd_layout)
+
+        # --- SHORTCUT CREATION (all three text fields are required together) ---
+        main_layout.addWidget(self._make_section_label("Shortcut Creation"))
+        shortcut_layout = QHBoxLayout()
+        shortcut_layout.setContentsMargins(0, 0, 0, 0)
+        shortcut_layout.setSpacing(6)
+
+        self.btn_shortcut_icon = IconDropButton(self)
+        self.btn_shortcut_icon.setObjectName("IconSelectBtn")
+        self.btn_shortcut_icon.setFixedSize(34, 34)
+        self.btn_shortcut_icon.setIcon(self.default_btn_icon)
+        self.btn_shortcut_icon.setIconSize(QSize(24, 24))
+        self.btn_shortcut_icon.setToolTip(
+            "Left-click or drop file: set shortcut icon. Right-click: restore default icon."
+        )
+        self.btn_shortcut_icon.clicked.connect(self.open_shortcut_icon_menu)
+        self.btn_shortcut_icon.fileDropped.connect(self.apply_shortcut_icon_file)
+        self.btn_shortcut_icon.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.btn_shortcut_icon.customContextMenuRequested.connect(self.reset_shortcut_icon)
+        shortcut_layout.addWidget(self.btn_shortcut_icon)
+
+        self.inp_shortcut_name = ScrollingLineEdit()
+        self.inp_shortcut_name.setPlaceholderText("Name...")
+        self.inp_shortcut_name.setToolTip("Name")
+        self.inp_shortcut_name.setFixedHeight(34)
+        self.inp_shortcut_name.setValidator(win_filename_validator)
+        shortcut_layout.addWidget(self.inp_shortcut_name, stretch=3)
+
+        self.inp_shortcut_path = SmartLineEdit(
+            "Path...", mode="shortcut_path", parent_win=self
+        )
+        self.inp_shortcut_path.setToolTip("Path: Desktop, Start Menu, both, or a custom folder")
+        self.inp_shortcut_path.setValidator(win_path_validator)
+        shortcut_layout.addWidget(self.inp_shortcut_path, stretch=3)
+
+        self.inp_shortcut_run = SmartLineEdit(
+            "Run File...", mode="shortcut_run_file", parent_win=self
+        )
+        self.inp_shortcut_run.setToolTip("Run File: file inside the extracted package")
+        shortcut_layout.addWidget(self.inp_shortcut_run, stretch=3)
+        main_layout.addLayout(shortcut_layout)
 
         # --- GROUP 3: OPTIONS ---
         main_layout.addWidget(self._make_section_label("Options"))
@@ -2747,7 +3363,7 @@ class ByteWrapperWindow(QWidget):
         exp_imp_layout.addWidget(self.btn_import)
         left_bottom.addLayout(exp_imp_layout)
 
-        self.inp_password = QLineEdit()
+        self.inp_password = ScrollingLineEdit()
         self.inp_password.setObjectName("PasswordInput")
         self.inp_password.setPlaceholderText("Password...")
         self.inp_password.setEchoMode(QLineEdit.EchoMode.Password)
@@ -2766,14 +3382,15 @@ class ByteWrapperWindow(QWidget):
 
         fields = (
             self.inp_source, self.inp_extract, self.inp_run, self.inp_output,
-            self.inp_name, self.inp_desc, self.inp_version, self.inp_password
+            self.inp_name, self.inp_desc, self.inp_version, self.inp_password,
+            self.inp_shortcut_name, self.inp_shortcut_path, self.inp_shortcut_run,
         )
         for field in fields:
             field.textChanged.connect(self.reset_start_status)
         for option in all_checks:
             option.toggled.connect(self.reset_start_status)
         self._build_controls = (
-            self.logo_label, self.btn_icon, self.btn_export, self.btn_import,
+            self.logo_label, self.btn_icon, self.btn_shortcut_icon, self.btn_export, self.btn_import,
             *fields, *all_checks,
         )
         self._refresh_hidden_availability()
@@ -3096,6 +3713,7 @@ class ByteWrapperWindow(QWidget):
         if normalized == self._tracked_source_path:
             return
         self._tracked_source_path = normalized
+        self._run_file_icon_timer.stop()
         self._update_source_cache(raw_text)
         self._user_edited_name = False
         self._last_run_cand = ""
@@ -3134,29 +3752,37 @@ class ByteWrapperWindow(QWidget):
             )
 
     def on_run_file_changed(self, text: str):
-        if self._updating_ui or self._user_edited_name:
-            return
-        raw = text.strip()
-        if not raw:
-            self._last_run_cand = ""
-            if self.inp_name.text():
-                self._updating_ui = True
-                self.inp_name.clear()
-                self._updating_ui = False
-                self._sync_dont_replace_state()
+        if self._updating_ui:
             return
 
-        candidate, _ = _split_command_and_args(raw)
+        candidate, _ = _split_command_and_args(text.strip())
+        # Argument edits alone must not override a manually selected name/icon.
         if candidate == self._last_run_cand:
             return
         self._last_run_cand = candidate
+        self._run_file_icon_timer.stop()
 
-        stem_clean = _derive_auto_name_from_path(candidate, strip_ext=True)
-        if stem_clean and self.inp_name.text() != stem_clean:
-            self._updating_ui = True
-            self.inp_name.setText(stem_clean)
+        # A different Run File is a new package identity. Discard old overrides,
+        # even when its name or icon was previously changed manually.
+        self._user_edited_name = False
+        self.reset_icon_to_default()
+        stem = _derive_auto_name_from_path(candidate, strip_ext=True) if candidate else ""
+        self._updating_ui = True
+        try:
+            self.inp_name.setText(stem)
+        finally:
             self._updating_ui = False
-            self._sync_dont_replace_state()
+        self._sync_dont_replace_state()
+
+        if candidate:
+            self._run_file_icon_timer.start(300)
+
+    def _refresh_auto_icon_from_run_file(self):
+        if self._updating_ui or not self.inp_run.isEnabled():
+            return
+        candidate, _ = _split_command_and_args(self.inp_run.text())
+        if candidate and candidate == self._last_run_cand:
+            self.set_icon_from_run_file()
 
     # --------------------------------------------------------------------------
     # 4.4. GROUP 2 HANDLERS: ICON, NAME, DESCRIPTION, VERSION
@@ -3183,21 +3809,32 @@ class ByteWrapperWindow(QWidget):
         self.reset_start_status()
 
     def open_icon_menu(self):
+        self._show_icon_menu(for_shortcut=False)
+
+    def open_shortcut_icon_menu(self):
+        self._show_icon_menu(for_shortcut=True)
+
+    def _show_icon_menu(self, for_shortcut: bool):
+        """The main and shortcut icons expose the same selection actions."""
+        target_button = self.btn_shortcut_icon if for_shortcut else self.btn_icon
         menu = QMenu(self)
         act_auto = menu.addAction("1. Get Automatically from Run File")
         act_select = menu.addAction("2. Select Icon...")
         act_imageres = menu.addAction("3. Select from imageres.dll...")
         act_shell32 = menu.addAction("4. Select from shell32.dll...")
 
-        action = menu.exec(self.btn_icon.mapToGlobal(QPoint(0, self.btn_icon.height())))
+        action = menu.exec(target_button.mapToGlobal(QPoint(0, target_button.height())))
         if action == act_auto:
-            self.set_icon_from_run_file()
+            if for_shortcut:
+                self.set_shortcut_icon_from_run_file()
+            else:
+                self.set_icon_from_run_file()
         elif action == act_select:
-            self.select_icon_from_dialog()
+            self.select_icon_from_dialog(for_shortcut=for_shortcut)
         elif action == act_imageres:
-            self.select_icon_from_system_dll("imageres.dll")
+            self.select_icon_from_system_dll("imageres.dll", for_shortcut=for_shortcut)
         elif action == act_shell32:
-            self.select_icon_from_system_dll("shell32.dll")
+            self.select_icon_from_system_dll("shell32.dll", for_shortcut=for_shortcut)
 
     def apply_custom_icon_file(self, file_path: str, icon_idx: int | None = None) -> bool:
         resolved_path, resolved_idx = _split_icon_source(file_path, icon_idx)
@@ -3211,9 +3848,17 @@ class ByteWrapperWindow(QWidget):
         if not ico_bytes or pil_img is None:
             self.btn_icon.setToolTip("Could not extract or convert the selected icon.")
             return False
+        # A manual icon choice wins over any pending Run File auto-detection.
+        was_default = not (self.current_icon_source or self.current_icon_bytes)
+        other_default = not (self.current_shortcut_icon_source or self.current_shortcut_icon_bytes)
+        self._run_file_icon_timer.stop()
         self.current_icon_source = target_source
         self.current_icon_bytes = ico_bytes
         self._set_button_icon_pil(pil_img)
+        if not self._updating_ui and not self._initial_icon_sync_done:
+            self._initial_icon_sync_done = True
+            if was_default and other_default:
+                self._assign_shortcut_icon(target_source, ico_bytes, pil_img)
         label = (
             f"{os.path.basename(resolved_path)} (#{resolved_idx})"
             if resolved_idx is not None else os.path.basename(resolved_path)
@@ -3222,7 +3867,7 @@ class ByteWrapperWindow(QWidget):
         self.reset_start_status()
         return True
 
-    def select_icon_from_system_dll(self, dll_name: str):
+    def select_icon_from_system_dll(self, dll_name: str, for_shortcut: bool = False):
         sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
         dll_path = os.path.join(sys32, dll_name)
         if not os.path.isfile(dll_path):
@@ -3230,7 +3875,8 @@ class ByteWrapperWindow(QWidget):
         buf = ctypes.create_unicode_buffer(dll_path, 260)
         icon_idx = ctypes.c_int(0)
         if _SHELL32.PickIconDlg(int(self.winId()), buf, 260, ctypes.byref(icon_idx)):
-            self.apply_custom_icon_file(expand_path(buf.value), icon_idx.value)
+            apply_icon = self.apply_shortcut_icon_file if for_shortcut else self.apply_custom_icon_file
+            apply_icon(expand_path(buf.value), icon_idx.value)
 
     def set_icon_from_run_file(self):
         cmd_part, _ = _split_command_and_args(self.inp_run.text())
@@ -3245,7 +3891,7 @@ class ByteWrapperWindow(QWidget):
             return
         self.apply_custom_icon_file(target_file)
 
-    def select_icon_from_dialog(self):
+    def select_icon_from_dialog(self, for_shortcut: bool = False):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Icon or Application",
@@ -3253,7 +3899,69 @@ class ByteWrapperWindow(QWidget):
             "Icon & Executable Files (*.ico *.png *.jpeg *.jpg *.jxl *.exe)"
         )
         if file_path:
-            self.apply_custom_icon_file(expand_path(file_path))
+            apply_icon = self.apply_shortcut_icon_file if for_shortcut else self.apply_custom_icon_file
+            apply_icon(expand_path(file_path))
+
+    def reset_shortcut_icon(self, _pos=None):
+        """Restore the same visible and embedded default icon as the main button."""
+        self.current_shortcut_icon_source = ""
+        self.current_shortcut_icon_bytes = b""
+        self.btn_shortcut_icon.setIcon(self.default_btn_icon)
+        self.btn_shortcut_icon.setToolTip(
+            "Left-click or drop file: set shortcut icon. Right-click: restore default icon."
+        )
+        self.reset_start_status()
+
+    def _assign_shortcut_icon(self, source: str, icon_data: bytes, pil_img: Image.Image):
+        """Set an already-decoded shortcut icon without retriggering icon synchronization."""
+        self.current_shortcut_icon_source = source
+        self.current_shortcut_icon_bytes = icon_data
+        dpr = max(1.0, self.devicePixelRatioF())
+        self.btn_shortcut_icon.setIcon(QIcon(pil_to_qpixmap(pil_img, 24, dpr)))
+        self.btn_shortcut_icon.setToolTip(f"Shortcut icon loaded from: {source}")
+
+    def apply_shortcut_icon_file(self, file_path: str, icon_idx: int | None = None) -> bool:
+        resolved_path, resolved_idx = _split_icon_source(file_path, icon_idx)
+        if not resolved_path:
+            self.btn_shortcut_icon.setToolTip("Shortcut icon file was not found.")
+            return False
+        target_source = f"{resolved_path},{resolved_idx}" if resolved_idx is not None else resolved_path
+        if target_source == self.current_shortcut_icon_source and self.current_shortcut_icon_bytes:
+            return True
+        icon_data, pil_img = extract_icon_from_file(resolved_path, resolved_idx)
+        if not icon_data or pil_img is None:
+            self.btn_shortcut_icon.setToolTip("Unable to read shortcut icon.")
+            return False
+
+        was_default = not (self.current_shortcut_icon_source or self.current_shortcut_icon_bytes)
+        other_default = not (self.current_icon_source or self.current_icon_bytes)
+        self._assign_shortcut_icon(target_source, icon_data, pil_img)
+        if not self._updating_ui and not self._initial_icon_sync_done:
+            self._initial_icon_sync_done = True
+            if was_default and other_default:
+                # Assign directly to avoid reopening the first-choice sync path.
+                self._run_file_icon_timer.stop()
+                self.current_icon_source = target_source
+                self.current_icon_bytes = icon_data
+                self._set_button_icon_pil(pil_img)
+                self.btn_icon.setToolTip(f"Icon loaded from: {target_source}")
+        self.reset_start_status()
+        return True
+
+    def set_shortcut_icon_from_run_file(self):
+        """Prefer Shortcut Run File; fall back to the main Run File if it is empty."""
+        run_text = self.inp_shortcut_run.text().strip() or self.inp_run.text().strip()
+        cmd_part, _ = _split_command_and_args(run_text)
+        target_file, _ = _resolve_run_file(
+            self._resolved_source,
+            cmd_part,
+            source_resolved=True,
+            source_kind=self._source_kind,
+        )
+        if not target_file:
+            self.btn_shortcut_icon.setToolTip("Could not locate an icon from Run File or Source Folder.")
+            return
+        self.apply_shortcut_icon_file(target_file)
 
     def on_name_manually_edited(self, text: str):
         self._user_edited_name = bool(text.strip())
@@ -3274,9 +3982,16 @@ class ByteWrapperWindow(QWidget):
             return
         self._user_dont_replace = checked
 
+    def _ensure_default_extract_to(self):
+        """Display the existing temporary extraction default when a mode needs it."""
+        if not self.inp_extract.text().strip():
+            self.inp_extract.setText("%Temp%")
+
     def on_extract_only_toggled(self, checked: bool):
         if self._updating_ui:
             return
+        if checked:
+            self._ensure_default_extract_to()
         if checked and self.chk_hidden.isChecked():
             self._updating_ui = True
             self.chk_hidden.setChecked(False)
@@ -3289,6 +4004,8 @@ class ByteWrapperWindow(QWidget):
     def on_hidden_run_toggled(self, checked: bool):
         if self._updating_ui:
             return
+        if checked:
+            self._ensure_default_extract_to()
         if checked and self.chk_extract_only.isChecked():
             self._updating_ui = True
             self.chk_extract_only.setChecked(False)
@@ -3333,6 +4050,10 @@ class ByteWrapperWindow(QWidget):
             "description": self.inp_desc.text(),
             "version": self.inp_version.text(),
             "icon_source": self.current_icon_source,
+            "shortcut_icon_source": self.current_shortcut_icon_source,
+            "shortcut_name": self.inp_shortcut_name.text(),
+            "shortcut_path": self.inp_shortcut_path.text(),
+            "shortcut_run_file": self.inp_shortcut_run.text(),
             "run_as_admin": self.chk_admin.isChecked(),
             "hidden_run": self.chk_hidden.isChecked(),
             "dont_replace": self.chk_dont_replace.isChecked(),
@@ -3346,6 +4067,7 @@ class ByteWrapperWindow(QWidget):
         }
         if include_icon_bytes:
             cfg["icon_bytes"] = self.current_icon_bytes
+            cfg["shortcut_icon_bytes"] = self.current_shortcut_icon_bytes
         return cfg
 
     def export_config(self):
@@ -3436,6 +4158,7 @@ class ByteWrapperWindow(QWidget):
             self._fail_start(err_msg)
             return
 
+        self._run_file_icon_timer.stop()
         self._updating_ui = True
         try:
             run_val = str_vals["run_file"]
@@ -3462,6 +4185,9 @@ class ByteWrapperWindow(QWidget):
             self.inp_output.setText(str_vals["output"])
             self.inp_desc.setText(desc_val)
             self.inp_version.setText(ver_val)
+            self.inp_shortcut_name.setText(str_vals["shortcut_name"])
+            self.inp_shortcut_path.setText(str_vals["shortcut_path"])
+            self.inp_shortcut_run.setText(str_vals["shortcut_run_file"])
 
             dont_replace_val = bool_vals["dont_replace"]
             self._user_dont_replace = dont_replace_val
@@ -3476,6 +4202,8 @@ class ByteWrapperWindow(QWidget):
             self.chk_crypto.setChecked(bool_vals["crypto"])
             self.chk_instances.setChecked(bool_vals["instances"])
             self.inp_run.setEnabled(not extract_only)
+            if extract_only or bool_vals["hidden_run"]:
+                self._ensure_default_extract_to()
             self._refresh_hidden_availability()
 
             self.inp_password.setText(pw_val)
@@ -3485,6 +4213,13 @@ class ByteWrapperWindow(QWidget):
                 self.reset_icon_to_default()
             elif not self.apply_custom_icon_file(raw_icon_src):
                 self.reset_icon_to_default(keep_tooltip=True)
+
+            shortcut_icon_src = str_vals["shortcut_icon_source"].strip()
+            if not shortcut_icon_src or not self.apply_shortcut_icon_file(shortcut_icon_src):
+                self.reset_shortcut_icon()
+            self._initial_icon_sync_done = bool(
+                self.current_icon_source or self.current_shortcut_icon_source
+            )
 
             self.btn_import.setToolTip("")
         finally:
@@ -3561,8 +4296,8 @@ class ByteWrapperWindow(QWidget):
             return
 
         extract_clean = raw_extract.strip('"').strip("'").strip()
-        if _has_invalid_path_chars(extract_clean):
-            self._fail_start("Extract To cannot be empty or contain invalid characters.")
+        if extract_clean and _has_invalid_path_chars(extract_clean):
+            self._fail_start("Extract To contains invalid path characters.")
             return
 
         extract_only = self.chk_extract_only.isChecked()
@@ -3570,6 +4305,36 @@ class ByteWrapperWindow(QWidget):
         if not extract_only and _has_invalid_path_chars(cmd_part):
             self._fail_start("Run File cannot be empty or contain invalid path characters.")
             return
+
+        shortcut_name = self.inp_shortcut_name.text().strip()
+        shortcut_path = self.inp_shortcut_path.text().strip()
+        shortcut_command, shortcut_arguments = _split_command_and_args(
+            self.inp_shortcut_run.text()
+        )
+        shortcut_fields = {
+            "Name": shortcut_name,
+            "Path": shortcut_path,
+            "Run File": shortcut_command,
+        }
+        if any(shortcut_fields.values()) and not all(shortcut_fields.values()):
+            missing = ", ".join(label for label, val in shortcut_fields.items() if not val)
+            self._fail_start(f"Shortcut Creation is incomplete. Missing: {missing}.")
+            return
+        # Default icon is valid; all three text inputs activate shortcut creation.
+        shortcut_active = all(shortcut_fields.values())
+        if shortcut_active:
+            shortcut_stem = shortcut_name[:-4] if shortcut_name.lower().endswith(".lnk") else shortcut_name
+            if not shortcut_stem.strip() or _INVALID_FILENAME_CHARS_RE.search(shortcut_stem) or \
+                    _RESERVED_WIN_NAMES_RE.match(shortcut_stem):
+                self._fail_start("Shortcut Name contains invalid filename characters.")
+                return
+            if shortcut_path not in ("Desktop", "Start Menu", "Start Menu & Desktop") \
+                    and _has_invalid_path_chars(shortcut_path):
+                self._fail_start("Shortcut Path contains invalid path characters.")
+                return
+            if _has_invalid_path_chars(shortcut_command):
+                self._fail_start("Shortcut Run File contains invalid path characters.")
+                return
 
         norm_output = expand_path(raw_output, resolve_abs=True)
         if not norm_output:
@@ -3620,6 +4385,12 @@ class ByteWrapperWindow(QWidget):
         cfg["parsed_version"] = parsed_ver
         cfg["seven_zip"] = seven_zip
         cfg["csc_path"] = csc_path
+        cfg["shortcut_active"] = bool(shortcut_active)
+        if shortcut_active and not cfg["shortcut_icon_bytes"]:
+            # A default shortcut icon is still an icon, not an incomplete input.
+            cfg["shortcut_icon_bytes"] = get_default_sfx_icon_bytes()
+        cfg["shortcut_command"] = shortcut_command if shortcut_active else ""
+        cfg["shortcut_args"] = shortcut_arguments if shortcut_active else ""
 
         self.btn_start.setEnabled(True)
         self.btn_start.setText("Cancel")
