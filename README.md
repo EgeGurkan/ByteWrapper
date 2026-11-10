@@ -84,7 +84,3 @@ The generated application will be in the `dist` folder.
 ## Feedback and Contributions
 
 Found a bug or have an idea for an improvement? Feel free to [open an issue](https://github.com/EgeGurkan/ByteWrapper/issues) or submit a pull request.
-
----
-
-Created by [EgeGurkan](https://github.com/EgeGurkan).
