@@ -43,7 +43,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QCheckBox, QProgressBar,
-    QFileDialog, QMenu, QMessageBox, QDialog
+    QFileDialog, QMenu, QMessageBox, QDialog, QToolButton,
+    QScrollArea
 )
 
 from PIL import Image, ImageDraw
@@ -760,7 +761,7 @@ def pil_to_qpixmap(pil_img: Image.Image, logical_size: int, dpr: float = 1.0) ->
     return pixmap
 
 
-def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0) -> bytes:
+def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0, group_id: int | str | None = None) -> bytes:
     """Extract raw RT_GROUP_ICON + RT_ICON bytes directly from a PE (.exe/.dll/.mun) file."""
     if not pe_path:
         return b""
@@ -788,7 +789,11 @@ def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0) -> bytes:
             return ctypes.string_at(ptr, size) if ptr else b""
 
         grp_data = b""
-        if icon_index < 0:
+        if group_id is not None:
+            grp_data = _read_res(14, group_id)
+            if not grp_data:
+                return b""
+        elif icon_index < 0:
             abs_id = abs(icon_index)
             grp_data = _read_res(14, abs_id) or _read_res(14, str(abs_id))
             if not grp_data:
@@ -856,6 +861,57 @@ def _extract_pe_icon_bytes(pe_path: str, icon_index: int = 0) -> bytes:
         return bytes(out)
     finally:
         _KERNEL32.FreeLibrary(hmod)
+
+
+def _list_pe_icon_group_ids(pe_path: str) -> list[int | str]:
+    """Return RT_GROUP_ICON resource IDs (including named groups) in PE order."""
+    if not os.path.isfile(pe_path):
+        return []
+    hmod = _KERNEL32.LoadLibraryExW(pe_path, None, 0x00000022)
+    if not hmod:
+        return []
+    try:
+        groups: list[int | str] = []
+
+        def _enum_cb(_hmodule, _restype, res_name, _param):
+            if not res_name:
+                return 1
+            groups.append(int(res_name) if res_name < 0x10000 else ctypes.wstring_at(res_name))
+            return 1
+
+        callback = _ENUMRESNAMEPROCW(_enum_cb)
+        _KERNEL32.EnumResourceNamesW(hmod, ctypes.c_void_p(14), callback, 0)
+        return groups
+    finally:
+        _KERNEL32.FreeLibrary(hmod)
+
+
+def _get_icon_resource_groups(pe_path: str) -> tuple[str, list[int | str]]:
+    """Prefer Windows .mun resources when icons have been moved out of a DLL/EXE."""
+    windows_dir = expand_path(os.environ.get("SystemRoot", r"C:\Windows"), resolve_abs=True)
+    if _relpath_if_within(pe_path, windows_dir):
+        mun_path = os.path.join(windows_dir, "SystemResources", os.path.basename(pe_path) + ".mun")
+        if os.path.isfile(mun_path):
+            groups = _list_pe_icon_group_ids(mun_path)
+            if groups:
+                return mun_path, groups
+    return pe_path, _list_pe_icon_group_ids(pe_path)
+
+
+def _icon_export_directory(pe_path: str) -> str:
+    """Save beside the source, except for files within the Windows directory tree."""
+    windows_dir = expand_path(os.environ.get("SystemRoot", r"C:\Windows"), resolve_abs=True)
+    if not _relpath_if_within(pe_path, windows_dir):
+        return os.path.dirname(pe_path)
+
+    # The shell API returns the real Desktop location, including OneDrive redirects.
+    desktop = ctypes.create_unicode_buffer(32768)
+    try:
+        if _SHELL32.SHGetFolderPathW(None, 0x0010, None, 0, desktop) == 0 and desktop.value:
+            return desktop.value
+    except (AttributeError, OSError):
+        pass
+    return os.path.join(os.path.expanduser("~"), "Desktop")
 
 
 def _split_icon_source(file_path: str, icon_idx: int | None = None) -> tuple[str, int | None]:
@@ -3108,8 +3164,162 @@ class _FileDropMixin:
             event.ignore()
 
 
+class EmbeddedIconSelectionDialog(QDialog):
+    """Click-to-toggle icon picker with explicit, visible selections.
+
+    Each icon is a real checkable button: clicking anywhere on its tile toggles
+    that icon, independently of the others. Nothing is preselected. Pressing
+    Enter cannot accidentally accept the dialog.
+    """
+
+    def __init__(self, filename: str, icons: list[tuple[int, bytes, Image.Image]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Select icons - {filename}")
+        self.resize(575, 460)
+        self.setMinimumSize(490, 350)
+        self.icon_buttons: dict[int, QToolButton] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        instructions = QLabel(
+            "Click an icon to select it; click again to deselect it. "
+            "You can select more than one."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        # QListWidget IconMode + inherited application styles made its selection
+        # difficult to see or interact with. Use independent buttons instead.
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: #101722; border: none; }")
+        content = QWidget(scroll)
+        content.setObjectName("IconPickerContent")
+        grid = QGridLayout(content)
+        grid.setContentsMargins(10, 10, 10, 10)
+        grid.setSpacing(10)
+        grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+
+        for position, (resource_index, _ico_data, pil_img) in enumerate(icons):
+            label = f"Icon {resource_index + 1}"
+            tile = QToolButton(content)
+            tile.setObjectName("EmbeddedIconTile")
+            tile.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            tile.setIcon(QIcon(pil_to_qpixmap(pil_img, 64)))
+            tile.setIconSize(QSize(64, 64))
+            tile.setCheckable(True)
+            tile.setChecked(False)
+            tile.setAutoRaise(False)
+            tile.setText(label)
+            tile.setFixedSize(112, 119)
+            tile.setToolTip(f"Select {label}")
+            tile.toggled.connect(
+                lambda checked, button=tile, name=label: self._on_tile_toggled(button, name, checked)
+            )
+            grid.addWidget(tile, position // 4, position % 4)
+            self.icon_buttons[resource_index] = tile
+
+        content.setStyleSheet("""
+            QWidget#IconPickerContent { background-color: #101722; }
+            QToolButton#EmbeddedIconTile {
+                background-color: #1b2735;
+                border: 2px solid #334155;
+                border-radius: 7px;
+                color: #e2e8f0;
+                font-size: 12px;
+                padding: 3px;
+            }
+            QToolButton#EmbeddedIconTile:hover {
+                background-color: #26384c;
+                border-color: #60a5fa;
+            }
+            QToolButton#EmbeddedIconTile:checked {
+                background-color: #174579;
+                border: 3px solid #60a5fa;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QToolButton#EmbeddedIconTile:checked:hover {
+                background-color: #21558b;
+            }
+        """)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        controls = QHBoxLayout()
+        self.selection_label = QLabel("0 icons selected")
+        controls.addWidget(self.selection_label)
+        controls.addStretch(1)
+
+        select_all = QPushButton("Select all")
+        select_all.setAutoDefault(False)
+        select_all.clicked.connect(lambda: self._set_all_checked(True))
+        controls.addWidget(select_all)
+
+        clear_selection = QPushButton("Clear")
+        clear_selection.setAutoDefault(False)
+        clear_selection.clicked.connect(lambda: self._set_all_checked(False))
+        controls.addWidget(clear_selection)
+        layout.addLayout(controls)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setAutoDefault(False)
+        cancel_button.clicked.connect(self.reject)
+        actions.addWidget(cancel_button)
+
+        self.save_button = QPushButton("Save selected icons")
+        self.save_button.setAutoDefault(False)
+        self.save_button.setDefault(False)
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(self._validate_selection)
+        actions.addWidget(self.save_button)
+        layout.addLayout(actions)
+
+        self.setStyleSheet(self.styleSheet() + """
+            QPushButton { background-color: #1e293b; color: #e2e8f0;
+                border: 1px solid #475569; border-radius: 5px; padding: 7px 12px; }
+            QPushButton:hover { background-color: #334155; border-color: #60a5fa; }
+            QPushButton:disabled { background-color: #17202b; color: #64748b;
+                border-color: #273444; }
+        """)
+        self._refresh_selection_count()
+
+    def _on_tile_toggled(self, tile: QToolButton, name: str, selected: bool):
+        tile.setText(("✓ " if selected else "") + name)
+        tile.setToolTip(("Deselect " if selected else "Select ") + name)
+        self._refresh_selection_count()
+
+    def _refresh_selection_count(self):
+        count = sum(button.isChecked() for button in self.icon_buttons.values())
+        self.selection_label.setText(f"{count} icon(s) selected")
+        self.save_button.setEnabled(count > 0)
+
+    def _set_all_checked(self, selected: bool):
+        for button in self.icon_buttons.values():
+            button.setChecked(selected)
+        self._refresh_selection_count()
+
+    def _validate_selection(self):
+        if not self.selected_resource_indices():
+            return  # Never save anything that the user did not select.
+        self.accept()
+
+    def keyPressEvent(self, event):
+        # Avoid Qt's implicit dialog default action: Enter must not export icons.
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def selected_resource_indices(self) -> list[int]:
+        return sorted(index for index, button in self.icon_buttons.items() if button.isChecked())
+
+
 class SFXDropLogo(_FileDropMixin, QLabel):
-    """Header logo: left-click inspects SFX, right-click exports an EXE icon."""
+    """Header logo: left-click inspects SFX, right-click exports EXE/DLL icon groups."""
     fileDropped = pyqtSignal(str)
     clicked = pyqtSignal()
     rightClicked = pyqtSignal()
@@ -3120,7 +3330,7 @@ class SFXDropLogo(_FileDropMixin, QLabel):
         self.setAcceptDrops(True)
         self.setToolTip(
             'Left-click or drop an EXE/SFX to inspect its config. '
-            'Right-click to extract an EXE icon as an .ico file.'
+            'Right-click to extract one or more EXE/DLL icons as .ico files.'
         )
 
     def mousePressEvent(self, event):
@@ -4122,47 +4332,92 @@ class ByteWrapperWindow(QWidget):
             self.inspect_sfx_file(file_path)
 
     def on_logo_right_clicked(self):
-        """Choose an EXE and export its embedded icon group to a real ICO file."""
-        exe_path, _ = QFileDialog.getOpenFileName(
+        """Extract selected icon groups from EXE/DLL, preserving every included size."""
+        pe_path, _ = QFileDialog.getOpenFileName(
             self,
-            'Select EXE to Extract Icon',
-            '',
-            'Executable Files (*.exe)'
+            "Select EXE or DLL to Extract Icons",
+            "",
+            "Executable and Library Files (*.exe *.dll)",
         )
-        if not exe_path:
+        if not pe_path:
             return
 
-        exe_path = expand_path(exe_path)
-        if not os.path.isfile(exe_path) or not exe_path.lower().endswith('.exe'):
-            QMessageBox.warning(self, 'Icon Extraction', 'Please select a valid EXE file.')
+        pe_path = expand_path(pe_path, resolve_abs=True)
+        if not os.path.isfile(pe_path) or os.path.splitext(pe_path)[1].lower() not in (".exe", ".dll"):
+            QMessageBox.warning(self, "Icon Extraction", "Please select a valid EXE or DLL file.")
             return
 
-        # Reuse the existing PE resource extractor. It preserves all available
-        # sizes in the icon group rather than saving a low-resolution screenshot.
-        ico_bytes, _ = extract_icon_from_file(exe_path)
-        if not ico_bytes:
-            QMessageBox.warning(self, 'Icon Extraction', 'No extractable icon was found in this EXE.')
+        # A group corresponds to one distinct Windows icon, potentially with many
+        # sizes and color depths. Do not present resolutions as separate icons.
+        resource_path, group_ids = _get_icon_resource_groups(pe_path)
+        if not group_ids:
+            QMessageBox.warning(self, "Icon Extraction", "No embedded icon groups were found in this file.")
             return
 
-        default_name = os.path.splitext(os.path.basename(exe_path))[0] + '_icon.ico'
-        output_path, _ = QFileDialog.getSaveFileName(
-            self,
-            'Save Extracted Icon',
-            os.path.join(os.path.dirname(exe_path), default_name),
-            'Windows Icon (*.ico)'
-        )
-        if not output_path:
-            return
-        if not output_path.lower().endswith('.ico'):
-            output_path += '.ico'
+        prepared_icons: list[tuple[int, bytes, Image.Image]] = []
+        for index, group_id in enumerate(group_ids):
+            ico_bytes = _extract_pe_icon_bytes(resource_path, group_id=group_id)
+            pil_img = load_pil_from_ico_bytes(ico_bytes) if ico_bytes else None
+            if pil_img is not None:
+                prepared_icons.append((index, ico_bytes, pil_img))
 
+        if not prepared_icons:
+            QMessageBox.warning(self, "Icon Extraction", "No readable icons were found in this file.")
+            return
+
+        if len(prepared_icons) > 1:
+            dialog = EmbeddedIconSelectionDialog(os.path.basename(pe_path), prepared_icons, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected_indices = set(dialog.selected_resource_indices())
+            selected_icons = [icon for icon in prepared_icons if icon[0] in selected_indices]
+            if not selected_icons:
+                return
+        else:
+            selected_icons = prepared_icons
+
+        output_dir = _icon_export_directory(pe_path)
+        stem = os.path.splitext(os.path.basename(pe_path))[0]
+        multiple = len(selected_icons) > 1
+        filenames = [f"{stem}_{i}.ico" for i in range(1, len(selected_icons) + 1)] if multiple else [f"{stem}.ico"]
+        output_paths = [os.path.join(output_dir, filename) for filename in filenames]
+
+        existing = [path for path in output_paths if os.path.exists(path)]
+        if existing:
+            response = QMessageBox.question(
+                self,
+                "Icon Extraction",
+                f"{len(existing)} destination file(s) already exist. Overwrite them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                return
+
+        staged_paths = []
         try:
-            with open(output_path, 'wb') as output:
-                output.write(ico_bytes)
+            os.makedirs(output_dir, exist_ok=True)
+            # Stage each ICO in the destination folder before replacing final files.
+            for _index, data, _image in selected_icons:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=output_dir, prefix=".byte_wrapper_icon_", suffix=".tmp", delete=False
+                ) as output:
+                    staged_paths.append(output.name)
+                    output.write(data)
+            for temporary_path, output_path in zip(staged_paths, output_paths):
+                os.replace(temporary_path, output_path)
         except OSError as exc:
-            QMessageBox.warning(self, 'Icon Extraction', f'Could not save the icon:\n{exc}')
+            QMessageBox.warning(self, "Icon Extraction", f"Could not save the icon(s):\n{exc}")
             return
-        QMessageBox.information(self, 'Icon Extraction', f'Icon extracted successfully:\n{output_path}')
+        finally:
+            for temporary_path in staged_paths:
+                _remove_temporary_path(temporary_path)
+
+        if len(output_paths) == 1:
+            message = f"Icon extracted successfully:\n{output_paths[0]}"
+        else:
+            message = f"{len(output_paths)} icons saved to:\n{output_dir}\n\n" + "\n".join(filenames)
+        QMessageBox.information(self, "Icon Extraction", message)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         event.acceptProposedAction() if not self._build_busy and _has_matching_url(event, (".json",)) else event.ignore()
