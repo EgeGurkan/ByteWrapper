@@ -3109,15 +3109,19 @@ class _FileDropMixin:
 
 
 class SFXDropLogo(_FileDropMixin, QLabel):
-    """Clickable header logo which also accepts local .exe/.sfx file drops."""
+    """Header logo: left-click inspects SFX, right-click exports an EXE icon."""
     fileDropped = pyqtSignal(str)
     clicked = pyqtSignal()
+    rightClicked = pyqtSignal()
     _EXTS = (".exe", ".sfx")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self.setToolTip('Click to inspect an EXE/SFX or drop it here to open its config in your default editor.')
+        self.setToolTip(
+            'Left-click or drop an EXE/SFX to inspect its config. '
+            'Right-click to extract an EXE icon as an .ico file.'
+        )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -3125,6 +3129,10 @@ class SFXDropLogo(_FileDropMixin, QLabel):
             event.accept()
         else:
             super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        self.rightClicked.emit()
+        event.accept()
 
 
 class IconDropButton(_FileDropMixin, QPushButton):
@@ -3650,6 +3658,7 @@ class ByteWrapperWindow(QWidget):
         self.logo_label = SFXDropLogo(self)
         self.logo_label.fileDropped.connect(self.inspect_sfx_file)
         self.logo_label.clicked.connect(self.on_logo_clicked)
+        self.logo_label.rightClicked.connect(self.on_logo_right_clicked)
         logo_dpr = max(1.0, self.devicePixelRatioF())
         self.logo_label.setPixmap(pil_to_qpixmap(get_default_parcel_image(), 36, logo_dpr))
         self.logo_label.setFixedSize(36, 36)
@@ -4111,6 +4120,49 @@ class ByteWrapperWindow(QWidget):
         )
         if file_path:
             self.inspect_sfx_file(file_path)
+
+    def on_logo_right_clicked(self):
+        """Choose an EXE and export its embedded icon group to a real ICO file."""
+        exe_path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Select EXE to Extract Icon',
+            '',
+            'Executable Files (*.exe)'
+        )
+        if not exe_path:
+            return
+
+        exe_path = expand_path(exe_path)
+        if not os.path.isfile(exe_path) or not exe_path.lower().endswith('.exe'):
+            QMessageBox.warning(self, 'Icon Extraction', 'Please select a valid EXE file.')
+            return
+
+        # Reuse the existing PE resource extractor. It preserves all available
+        # sizes in the icon group rather than saving a low-resolution screenshot.
+        ico_bytes, _ = extract_icon_from_file(exe_path)
+        if not ico_bytes:
+            QMessageBox.warning(self, 'Icon Extraction', 'No extractable icon was found in this EXE.')
+            return
+
+        default_name = os.path.splitext(os.path.basename(exe_path))[0] + '_icon.ico'
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Save Extracted Icon',
+            os.path.join(os.path.dirname(exe_path), default_name),
+            'Windows Icon (*.ico)'
+        )
+        if not output_path:
+            return
+        if not output_path.lower().endswith('.ico'):
+            output_path += '.ico'
+
+        try:
+            with open(output_path, 'wb') as output:
+                output.write(ico_bytes)
+        except OSError as exc:
+            QMessageBox.warning(self, 'Icon Extraction', f'Could not save the icon:\n{exc}')
+            return
+        QMessageBox.information(self, 'Icon Extraction', f'Icon extracted successfully:\n{output_path}')
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         event.acceptProposedAction() if not self._build_busy and _has_matching_url(event, (".json",)) else event.ignore()
